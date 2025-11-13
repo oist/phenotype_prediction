@@ -35,14 +35,10 @@ def xgboost_train_accur(X_train, y_train, X_test, y_test, device, groups=None, n
     """
     Trains XGBoost for the specified X/y train and test data.
     Returns dictionaries with training accuracy measures calculated for cross-validation and test.
-    """
-
-    
+    """    
     # Initialize training pipelina
     pipe = make_pipeline(XGBClassifier(n_jobs=THREADS if device == "cpu" else None, tree_method="gpu_hist" if device == "cpu" else "hist"))
 
-    
-    
     # create a scorer for MCC
     mcc_scorer = make_scorer(matthews_corrcoef)
     
@@ -125,19 +121,10 @@ def xgboost_accur_select_features(X_train, X_test, y_train, y_test, sorted_indic
             X_test_select_feat[:, select_feat] = 0
 
 
-       
-
-
         cv_accuracy_scores, test_accuracy_scores = xgboost_train_accur(X_train_select_feat, y_train, X_test_select_feat, y_test, device, groups=groups)
         cv_accur_arr.append(cv_accuracy_scores)
         test_accur_arr.append(test_accuracy_scores)
-        # if N==1:
-        #     print(f"feat = {select_feat}")
-        #     print(f"shape = {X_train_select_feat.shape}")
-        #     print(f"sum = {sum(X_train_select_feat)}")
-        #     print(X_train_select_feat)
 
-        #     print(test_accur_arr)
     return cv_accur_arr,  test_accur_arr, num_feat_plot 
 
 
