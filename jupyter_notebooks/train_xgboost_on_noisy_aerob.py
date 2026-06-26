@@ -1,23 +1,25 @@
-import pandas as pd
-import numpy as np
-import torch
 import os
 import sys
-import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
-from collections import defaultdict
 import argparse
-from xgboost import XGBClassifier, XGBRegressor
-from sklearn.pipeline import make_pipeline
-import torch
-from joblib import Parallel, delayed
-import joblib, os
-from tqdm import tqdm
-from utils.utils import read_aerob_data, pca_run_and_plot, tsne_plot
+from collections import defaultdict
 
-TAX_LEVEL = "phylum" # <----------------- taxonomy level for train/test split is here!!
+import joblib
+import numpy as np
+import pandas as pd
+import torch
+import matplotlib.pyplot as plt
+
+from joblib import Parallel, delayed
+from matplotlib.colors import ListedColormap
+from sklearn.pipeline import make_pipeline
+from tqdm import tqdm
+from xgboost import XGBClassifier, XGBRegressor
+
+from utils.utils import read_aerob_data
+
+TAX_LEVEL = "phylum" # <------------------ taxonomy level for train/test split is here!!
 DATA_DIRECTORY = "data_aerob"  # <-------- input data directory is here!!
-NUM_SPLITS_TO_READ = 5#30  # <-------------- number of splits to read and process is here!!
+NUM_SPLITS_TO_READ = 10  # <-------------- number of splits to read and process is here!!
 
 print(f"NUM_SPLITS_TO_READ = {NUM_SPLITS_TO_READ}")
 
@@ -28,97 +30,52 @@ TRAINED_MOD_DIR = "trained_models_train_val_test"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Params for the noisy training
-
 parser = argparse.ArgumentParser(description="Noise sampling experiment")
 parser.add_argument("--x_noisy_samples", type=int, default=10,
                     help="Number of noisy samples per clean sample")
 parser.add_argument("--noise_type", type=str, default=None,
                     help="Noise distribution")
 
+# Parse the input parameters
 args = parser.parse_args()
-
-# --- use args ---
 x_noisy_samples = args.x_noisy_samples
 noise_type = args.noise_type
 
 print(f"Calculating for x_noisy_samples = {x_noisy_samples}; noise_type = {noise_type}")
 
-mn_fp_arr = [0.15, 0.2, 0.5]#[0.0, 0.05, 0.1, 0.15, 0.2, 0.5]
-mn_fn_arr = [0.0, 0.2, 0.5, 1.0, 2.0, 4.0] 
-
+# Specify the fn and fp rates for which the models are trained
+mn_fp_arr = [0.0, 0.05, 0.1, 0.15, 0.2, 0.5]
+mn_fn_arr = [0.0, 0.2, 0.5, 1.0, 2.0, 4.0]
 mean_rem_add_rates_tuples = [(add, rem) for add in mn_fp_arr for rem in mn_fn_arr]
 
+#  GPU / CPU setup 
+use_gpu = torch.cuda.is_available()
+tree_method = "gpu_hist" if use_gpu else "hist"
+predictor = "gpu_predictor" if use_gpu else "auto"
 
-# def sample_rate(mean, sigma, high_lim = 1, size=1):
-#     if sigma == 0:
-#         return np.full(size, mean)[0]
-    
-#     # Define boundaries: [0, 2*mean]
-#     low, high = 0, high_lim#2 * mean
-    
-#     # Draw normal around mean, truncate to [0, 2*mean]
-#     samples = np.random.normal(mean, sigma, size * 10)  # oversample
-#     samples = samples[(samples >= low) & (samples <= high)]
-    
-#     if len(samples) < size:
-#        # fallback to uniform if truncation fails
-#         return np.random.uniform(low, high, size)[0]
-    
-#     return np.random.choice(samples, size=size, replace=False)[0]
+# Create an output directory if it doesn't exist yet
+if not os.path.exists(f"{OUTPUT_DIRECTORY}/{TRAINED_MOD_DIR}"):
+    os.makedirs(f"{OUTPUT_DIRECTORY}/{TRAINED_MOD_DIR}")
 
-# def flip_with_fractional_noise(X: torch.Tensor, fp_rate: float, fn_rate: float,
-#                                noise_std = 0.3, hard_fn_flag = False):
-#     X_noisy = X.float().clone()
-#     n_rows, _ = X_noisy.shape
-#     for i in range(n_rows):
-#         # False negatives: subtract (1 + noise) from fraction of positives
-#         pos_idx = torch.nonzero(X[i] > 0).flatten()
+# Noise rates distribution ssampling functions
+def sample_exp(mean):
+    sample = np.random.exponential(scale=mean)  
+    return sample
 
-#         n_fn = int(round(fn_rate * len(pos_idx)))
-        
-#         if n_fn > 0:
-#             fn_idx = pos_idx[torch.randperm(len(pos_idx))[:n_fn]]
-#             noise = torch.randn(len(fn_idx)) * noise_std
-#             if hard_fn_flag == False:
-#                 X_noisy[i, fn_idx] -= (1.0 + noise)
-#             else:
-#                 X_noisy[i, fn_idx] = 0 
+def sample_unif(mean):
+    sample = np.random.uniform(0, 2*mean)
+    return sample
 
-#         # False positives: add (1 + noise) to fraction of zeros
-#         zero_idx = torch.nonzero(X[i] == 0).flatten()
-#         n_fp = int(round(fp_rate * len(zero_idx)))
-#         if n_fp > 0:
-#             fp_idx = zero_idx[torch.randperm(len(zero_idx))[:n_fp]]
-#             noise = torch.randn(len(fp_idx)) * noise_std
-#             X_noisy[i, fp_idx] += (1.0 + noise)
-
-#     # Clamp to ensure no negatives
-#     X_noisy = torch.clamp(X_noisy, min=0.0)    
-#     return X_noisy
-
-# def augment_data_at_rate_and_length(X_val_train, y_label_train, n_clones, fp_rate_mean, sigma_fp, fn_rate_mean, sigma_fn, hard_fn_flag = False, noise_std=0.3):
-    
-#     X_augmented = X_val_train.clone()
-#     y_augmented = y_label_train.clone()
-    
-#     if n_clones == 0:
-#         return X_augmented, y_augmented
-        
-#     for _ in range(n_clones):
-#         fp_rate_sampled = sample_rate(fp_rate_mean, sigma_fp, high_lim = 0.2)
-#         fn_rate_sampled = sample_rate(fn_rate_mean, sigma_fn, high_lim = 1)
-    
-#         y_clone = y_label_train.clone()
-#         X_noisy = flip_with_fractional_noise(X_val_train, fp_rate_sampled, fn_rate_sampled, noise_std = noise_std, hard_fn_flag = hard_fn_flag)
-#         X_augmented = torch.cat([X_augmented, X_noisy.clone()], dim=0)
-#         y_augmented = torch.cat([y_augmented, y_label_train], dim=0)
-
-#     # shuffle the augmented dataset
-#     idx = torch.randperm(len(X_augmented))
-#     X_augmented, y_augmented = X_augmented[idx], y_augmented[idx]
-#     return X_augmented, y_augmented
+def sample_gamma(mean):
+    scale = 0.5
+    shape = mean/scale
+    sample = np.random.gamma(shape, scale)
+    return sample
 
 def apply_noise(genome, fp_rate=0.2, fn_rate=0.5):
+    """
+    Applies noise with the specified FP and FN rates to a genome. 
+    """
     genome_noisy = genome.float().clone()
 
     # False negatives (multiple hits per count, Poisson distributed)
@@ -133,22 +90,10 @@ def apply_noise(genome, fp_rate=0.2, fn_rate=0.5):
 
     return genome_noisy
     
-def sample_exp(mean):
-    sample = np.random.exponential(scale=mean)  # scale = 1/λ
-    return sample
-
-def sample_unif(mean):
-    sample = np.random.uniform(0, 2*mean)
-    return sample
-
-def sample_gamma(mean):#(shape, scale):
-    scale = 0.5
-    shape = mean/scale
-    sample = np.random.gamma(shape, scale)
-    return sample
-
-
 def augment_data_with_noise(X_val_train, y_label_train, n_clones, mean_fp, mean_fn, noise_type=None, filename=None):
+    """
+    Augments X, and y with [n_clones] noisy copies with respect to specified mean_fp, and mean_fn. 
+    """
     # Start with the original data as lists
     X_augmented_list = [X_val_train]
     y_augmented_list = [y_label_train]
@@ -192,16 +137,6 @@ def augment_data_with_noise(X_val_train, y_label_train, n_clones, mean_fp, mean_
 
     return X_augmented, y_augmented
 
-# --- GPU / CPU setup ---
-use_gpu = torch.cuda.is_available()
-tree_method = "gpu_hist" if use_gpu else "hist"
-predictor = "gpu_predictor" if use_gpu else "auto"
-
-# --- output dir ---
-if not os.path.exists(f"{OUTPUT_DIRECTORY}/{TRAINED_MOD_DIR}"):
-    os.makedirs(f"{OUTPUT_DIRECTORY}/{TRAINED_MOD_DIR}")
-
-# --- model factory ---
 def make_xgb():
     return XGBClassifier(
         n_estimators=500,
@@ -218,46 +153,53 @@ def make_xgb():
     )
 
 def train_one_split(split_id, fp_rate_mean, fn_rate_mean, x_noisy_samples):
+    """
+    Trains a model on the noise augmented specified train/test data split.
+    """
+    # Get the train data
     X_val_train = all_splits_dict[split_id]["X_train"]
     y_label_train = all_splits_dict[split_id]["y_train"]
-
-    filename = f"sampled_fps_fns_fp_mean_{fp_rate_mean}_fn_mean_{fn_rate_mean}_noise_type_{noise_type}_x_{x_noisy_samples}_split_{split_id}.txt"
-   # f"sampled_fps_fns_fp_mean_{fp_rate_mean}_fn_mean_{fn_rate_mean}_sigma_{sigma_fp}_x_{x_noisy_samples}_split_{split_id}.txt"
-
-    # augment training set
-    X_augmented, y_augmented = augment_data_with_noise(X_val_train, y_label_train, n_clones=x_noisy_samples, mean_fp=fp_rate_mean, mean_fn=fn_rate_mean, noise_type=noise_type, filename=filename)
     
+    # Augment training set
+    filename = f"sampled_fps_fns_fp_mean_{fp_rate_mean}_fn_mean_{fn_rate_mean}_noise_type_{noise_type}_x_{x_noisy_samples}_split_{split_id}.txt"
+    X_augmented, y_augmented = augment_data_with_noise(X_val_train, y_label_train, n_clones=x_noisy_samples, mean_fp=fp_rate_mean, mean_fn=fn_rate_mean, noise_type=noise_type, filename=filename)
 
-
+    # Train the model on the augmented train data
     model = make_xgb()
     pipe_with_noise = make_pipeline(model)
     pipe_with_noise.fit(X_augmented, y_augmented)
 
     return split_id, pipe_with_noise
 
-
-from collections import defaultdict
-
+# Read all train/test data
 all_splits_dict = defaultdict(int)
 for split_id in range(NUM_SPLITS_TO_READ):
     # Read train data
     data_filename_train = f"../{DATA_DIRECTORY}/input_data_train_val_test/{TAX_LEVEL}/train_data_{TAX_LEVEL}_split_{split_id}"
     y_filename_train = f"../{DATA_DIRECTORY}/input_data_train_val_test/{TAX_LEVEL}/train_annot_{TAX_LEVEL}_split_{split_id}"
     taxa_names_filename_train = f"../{DATA_DIRECTORY}/input_data_train_val_test/{TAX_LEVEL}/train_taxa_{TAX_LEVEL}_split_{split_id}" if TAX_LEVEL != "random" else None
-    X_val_train, y_label_train, X_column_names, taxa_group_names_train = read_aerob_data(data_filename_train, y_filename_train, taxa_names_filename_train, DEVICE)  
+    X_val_train = torch.load(data_filename_train)
+    y_label_train = torch.load(y_filename_train)
+    with open(taxa_names_filename_train, "r") as f:
+        taxa_group_names_train = [line.strip() for line in f]
 
     # Read validation data
     data_filename_val = f"../{DATA_DIRECTORY}/input_data_train_val_test/{TAX_LEVEL}/val_data_{TAX_LEVEL}_split_{split_id}"
     y_filename_val = f"../{DATA_DIRECTORY}/input_data_train_val_test/{TAX_LEVEL}/val_annot_{TAX_LEVEL}_split_{split_id}"
     taxa_names_filename_val = f"../{DATA_DIRECTORY}/input_data_train_val_test/{TAX_LEVEL}/val_taxa_{TAX_LEVEL}_split_{split_id}" if TAX_LEVEL != "random" else None
-    X_val_val, y_label_val, X_column_names, taxa_group_names_val = read_aerob_data(data_filename_val, y_filename_val, taxa_names_filename_val, DEVICE)  
+    X_val_val = torch.load(data_filename_val)
+    y_label_val = torch.load(y_filename_val)
+    with open(taxa_names_filename_val, "r") as f:
+        taxa_group_names_val = [line.strip() for line in f]
     
     # Read test data
     data_filename_test = f"../{DATA_DIRECTORY}/input_data_train_val_test/{TAX_LEVEL}/test_data_{TAX_LEVEL}_split_{split_id}"
     y_filename_test = f"../{DATA_DIRECTORY}/input_data_train_val_test/{TAX_LEVEL}/test_annot_{TAX_LEVEL}_split_{split_id}"
     taxa_names_filename_test = f"../{DATA_DIRECTORY}/input_data_train_val_test/{TAX_LEVEL}/test_taxa_{TAX_LEVEL}_split_{split_id}"  if TAX_LEVEL != "random" else None
-    X_val_test, y_label_test, X_column_names, taxa_group_names_test = read_aerob_data(data_filename_test, y_filename_test, taxa_names_filename_test, DEVICE)  
-
+    X_val_test = torch.load(data_filename_train)
+    y_label_test = torch.load(y_filename_train)
+    with open(taxa_names_filename_test, "r") as f:
+        taxa_group_names_test = [line.strip() for line in f]
 
     if sum(y_label_train)/len(y_label_train) < 0.01 or  sum(y_label_test)/len(y_label_test) < 0.01:
         print(f"Skipping split_id = {split_id}")
@@ -277,15 +219,13 @@ for split_id in range(NUM_SPLITS_TO_READ):
         curr_split_dict["X_val"] = X_val_val
         curr_split_dict["y_val"] = y_label_val
         curr_split_dict["taxa_group_names_val"] = taxa_group_names_val
-        curr_split_dict["feature_names"] = X_column_names
     
         all_splits_dict[split_id] = curr_split_dict
     
+print(f"added splits = {all_splits_dict.keys()}")
 
-
-# --- main loop ---
+# Main loop: train a model for each specified noise range
 trained_models_all_noise_rates = {}
-
 for fp_rate_mean, fn_rate_mean in tqdm(mean_rem_add_rates_tuples, desc="Noise configs..."):
     noise_rates = (fp_rate_mean, fn_rate_mean)
     print(f"noise_rates = {noise_rates}")
