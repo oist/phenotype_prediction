@@ -793,61 +793,97 @@ def xgboost_mixture_of_experts_2_class_cv_full(
 
 
 def find_accuracies_on_restricted_feat_space_contin(
-    all_splits_dict, all_markov_bound_dict_with_res, X_column_names, feature_condit, device
+    all_splits_dict,
+    all_markov_bound_dict_with_res,
+    X_column_names,
+    feature_condit,
+    device,
 ):
-    """Mixture-of-experts variant of the restricted-feature-space evaluation."""
-    test_splits = defaultdict(list)
+    cv_accur_dict_splits = defaultdict(list)
+    test_accur_dict_splits = defaultdict(list)
+
     print("Processing splits...")
 
-    for split_id in all_markov_bound_dict_with_res.keys():
-        sid = str(split_id)
-        split  = all_splits_dict[int(sid)]
-        X_train, y_train = split["X_train"], split["y_train"]
-        X_test,  y_test  = split["X_test"],  split["y_test"]
-        groups = split["taxa_group_names_train"]
-        mbs    = all_markov_bound_dict_with_res[sid]["MB"]
+    for split_id in map(str, all_markov_bound_dict_with_res.keys()):
 
-        y_np = y_train.cpu().numpy() if hasattr(y_train, "cpu") else np.asarray(y_train)
-        range_labels = label_ogt_range(y_np)
-        range_ids    = np.vectorize({"low": 0, "high": 1}.get)(range_labels)
-        classes      = np.unique(range_ids)
-        weights      = compute_class_weight("balanced", classes=classes, y=range_ids)
-        sample_weights = np.array([dict(zip(classes, weights))[c] for c in range_ids])
+        X_val_train = all_splits_dict[int(split_id)]["X_train"]
+        y_label_train = all_splits_dict[int(split_id)]["y_train"]
+        X_val_test = all_splits_dict[int(split_id)]["X_test"]
+        y_label_test = all_splits_dict[int(split_id)]["y_test"]
 
-        in_mb  = [i for i, v in enumerate(X_column_names) if v in mbs]
-        out_mb = [i for i, v in enumerate(X_column_names) if v not in mbs]
+        range_labels = label_ogt_range(y_label_train)
+        label_to_int = {"low": 0, "high": 1}
+        range_ids = np.vectorize(label_to_int.get)(range_labels)
 
-        def _zeroed(mask):
-            X_mod = X_test.clone() if hasattr(X_test, "clone") else X_test.copy()
-            X_mod[:, mask] = 0
-            return X_mod
+        classes = np.unique(range_ids)
+        weights = compute_class_weight(
+            class_weight="balanced",
+            classes=classes,
+            y=range_ids,
+        )
+        class_weights = dict(zip(classes, weights))
+        sample_weights = np.array([class_weights[c] for c in range_ids])
 
-        def _run(Xtr, Xte):
-            return xgboost_mixture_of_experts_2_class_cv_full(
-                Xtr, y_train, range_ids, sample_weights, Xte, y_test,
-                taxonomy_labels=groups,
-            )
+        taxa_group_names_train = all_splits_dict[int(split_id)]["taxa_group_names_train"]
+        mbs = all_markov_bound_dict_with_res[split_id]["MB"]
 
         if feature_condit == "mb_train_test":
-            res = _run(X_train[:, in_mb], X_test[:, in_mb])
+            indices = [i for i, f in enumerate(X_column_names) if f in mbs]
+            X_train, X_test = X_val_train[:, indices], X_val_test[:, indices]
+
         elif feature_condit == "mb_zero_test":
-            res = _run(X_train, _zeroed(in_mb))
+            indices = [i for i, f in enumerate(X_column_names) if f in mbs]
+            X_train = X_val_train
+            X_test = X_val_test.clone()
+            X_test[:, indices] = 0
+
         elif feature_condit == "full":
-            res = _run(X_train, X_test)
+            X_train, X_test = X_val_train, X_val_test
+
         elif feature_condit == "no_mb_train_test":
-            res = _run(X_train[:, out_mb], X_test[:, out_mb])
+            indices = [i for i, f in enumerate(X_column_names) if f not in mbs]
+            X_train, X_test = X_val_train[:, indices], X_val_test[:, indices]
+
         elif feature_condit == "no_mb_test":
-            res = _run(X_train, _zeroed(out_mb))
+            indices = [i for i, f in enumerate(X_column_names) if f not in mbs]
+            X_train = X_val_train
+            X_test = X_val_test.clone()
+            X_test[:, indices] = 0
+
         else:
-            raise ValueError(f"Unknown feature_condit: {feature_condit!r}")
+            raise ValueError(f"Unknown feature_condit: {feature_condit}")
 
-        for m, v in res["test_metrics"].items():
-            test_splits[m].append(v)
+        results = xgboost_mixture_of_experts_2_class_cv_full(
+            X_train,
+            y_label_train,
+            range_ids,
+            sample_weights,
+            X_test,
+            y_label_test,
+            taxonomy_labels=taxa_group_names_train,
+        )
 
-    test_mn  = {m: np.mean(test_splits[m]) for m in test_splits}
-    test_std = {m: np.std(test_splits[m])  for m in test_splits}
+        for metric, value in results["test_metrics"].items():
+            if metric in results["cv_metrics"]:
+                cv_accur_dict_splits[metric].append(results["cv_metrics"][metric])
+            test_accur_dict_splits[metric].append(value)
+
+    cv_mean, cv_std = defaultdict(float), defaultdict(float)
+    test_mean, test_std = defaultdict(float), defaultdict(float)
+
+    for metric in test_accur_dict_splits:
+
+        cv_vals = cv_accur_dict_splits.get(metric, [])
+        test_vals = test_accur_dict_splits.get(metric, [])
+
+        cv_mean[metric] = np.mean(cv_vals) if len(cv_vals) else np.nan
+        cv_std[metric] = np.std(cv_vals) if len(cv_vals) else np.nan
+
+        test_mean[metric] = np.mean(test_vals) if len(test_vals) else np.nan
+        test_std[metric] = np.std(test_vals) if len(test_vals) else np.nan
+
     print("Done!")
-    return defaultdict(float), defaultdict(float), test_mn, test_std
+    return cv_mean, cv_std, test_mean, test_std
 
 
 # COG annotation helper
