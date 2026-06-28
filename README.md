@@ -23,11 +23,10 @@ Batch training scripts for running model training on noise-augmented data across
 
 All the jupyter notebooks and the ba
 
-## Installation
-git clone + pip install, any non-obvious setup steps.
+Specify all the inputs/outputs!
 
-## Usage
-The 3–5 most common things someone would actually run, with minimal working examples.
+## Installation
+git clone + pip install, any non-obvious setup steps...
 
 ## Methods
 
