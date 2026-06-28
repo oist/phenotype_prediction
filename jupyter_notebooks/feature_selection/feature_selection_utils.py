@@ -1,587 +1,882 @@
+"""
+Utility functions for feature selection, model training, and evaluation.
+"""
+
+# Standard library 
+import copy
+import os
+import pickle
+import re
+import subprocess
+import warnings
+from collections import Counter, defaultdict
+from functools import lru_cache
+
+# Third-party 
 import numpy as np
-import matplotlib.pyplot as plt
 import pandas as pd
 import requests
-
-from sklearn.model_selection import GroupKFold
-
-import shap
-from xgboost import XGBClassifier, XGBRegressor
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import MaxAbsScaler
-from sklearn.model_selection import cross_val_score
-from sklearn.model_selection import cross_validate
-from sklearn.metrics import accuracy_score
-from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, balanced_accuracy_score
-from sklearn.metrics import matthews_corrcoef, make_scorer
-
-from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.feature_selection import SelectFromModel
-
-from sklearn.svm import LinearSVC
-from sklearn.feature_selection import SelectFromModel
-from sklearn.model_selection import StratifiedGroupKFold
-
-from sklearn.metrics import mutual_info_score
-from sklearn.feature_selection import mutual_info_regression
-from tqdm import tqdm
+import xgboost as xgb
 from joblib import Parallel, delayed
-
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.exceptions import UndefinedMetricWarning
+from sklearn.feature_selection import (
+    SelectFromModel,
+    mutual_info_classif,
+    mutual_info_regression,
+)
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    f1_score,
+    make_scorer,
+    matthews_corrcoef,
+    mean_squared_error,
+    mutual_info_score,
+    precision_score,
+    r2_score,
+    recall_score,
+)
+from sklearn.model_selection import (
+    GroupKFold,
+    KFold,
+    StratifiedGroupKFold,
+    cross_validate,
+)
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import LabelEncoder, MaxAbsScaler
+from sklearn.svm import LinearSVC
+from sklearn.utils.class_weight import compute_class_weight
+from tqdm import tqdm
+from xgboost import XGBClassifier, XGBRegressor
 
 THREADS = 64
 
-def xgboost_train_accur(X_train, y_train, X_test, y_test, device, groups=None, n_splits = 5):
+# Hardware helpers
+
+def is_gpu_available() -> bool:
+    try:
+        subprocess.check_output(["nvidia-smi"])
+        return True
+    except Exception:
+        return False
+
+# Calibration
+
+def expected_calibration_error(y_true, y_prob, n_bins: int = 10) -> float:
     """
-    Trains XGBoost for the specified X/y train and test data.
-    Returns dictionaries with training accuracy measures calculated for cross-validation and test.
-    """    
-    # Initialize training pipelina
-    pipe = make_pipeline(XGBClassifier(n_jobs=THREADS if device == "cpu" else None, tree_method="gpu_hist" if device == "cpu" else "hist"))
+    Expected Calibration Error (ECE) for binary predictions.
 
-    # create a scorer for MCC
-    mcc_scorer = make_scorer(matthews_corrcoef)
-    
-    # then pass it in your scoring dict
-    scoring = {
-        'accuracy': 'accuracy',
-        'balanced_accuracy': 'balanced_accuracy',
-        'precision': 'precision',
-        'recall': 'recall',
-        'mcc': mcc_scorer,
-        'f1': mcc_scorer
-    }
+    Groups predicted probabilities into equally spaced bins and computes
+    the weighted mean absolute difference between mean predicted probability
+    and empirical accuracy within each bin.
 
-    # Choose CV strategy
-    if groups is not None:
-        cv = StratifiedGroupKFold(n_splits=n_splits)
-        cv_results = cross_validate(
-            pipe,
-            X_train.cpu(), y_train.cpu(),
-            cv=cv,
-            groups=groups, 
-            scoring=scoring,
-            return_train_score=False
+    Parameters
+    ----------
+    y_true : array-like
+        Ground-truth binary labels (0 or 1).
+    y_prob : array-like
+        Predicted probabilities for the positive class.
+    n_bins : int
+        Number of equally spaced bins.
+
+    Returns
+    -------
+    float
+        ECE in [0, 1]; 0 = perfectly calibrated.
+    """
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    bin_edges = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        mask = (y_prob >= bin_edges[i]) & (y_prob < bin_edges[i + 1])
+        if np.any(mask):
+            ece += np.abs(y_true[mask].mean() - y_prob[mask].mean()) * mask.mean()
+    return ece
+
+
+def _ece_scorer_func(y_true, y_prob) -> float:
+    return expected_calibration_error(y_true, y_prob)
+
+
+# Core XGBoost training / evaluation
+
+def xgboost_train_accur(X_train, y_train, X_test, y_test, device, groups=None, n_splits: int = 5):
+    """
+    Train an XGBoost classifier and return cross-validated and held-out metrics.
+
+    Parameters
+    ----------
+    X_train, y_train : array-like
+        Training features and labels (torch tensors or numpy arrays).
+    X_test, y_test : array-like
+        Test features and labels.
+    device : str
+        "cpu" or "cuda".
+    groups : array-like, optional
+        Group labels for StratifiedGroupKFold.
+    n_splits : int
+        Number of CV folds.
+
+    Returns
+    -------
+    cv_accuracy_scores, test_accuracy_scores : dict
+        Dicts keyed by metric name.
+    """
+    use_gpu = device != "cpu" and is_gpu_available()
+    pipe = make_pipeline(
+        XGBClassifier(
+            n_jobs=None if use_gpu else THREADS,
+            tree_method="hist",
+            device="cuda" if use_gpu else "cpu",
         )
+    )
+    ece_scorer = make_scorer(_ece_scorer_func, response_method="predict_proba", greater_is_better=False)
+    mcc_scorer = make_scorer(matthews_corrcoef)
 
-    else:
-        cv = n_splits
-        cv_results = cross_validate(pipe, X_train.cpu(), y_train.cpu(), cv=cv, scoring=scoring, return_train_score=False)
-    
-    cv_accuracy_scores = {
-        'mcc': np.mean(cv_results['test_mcc']),
-        'balanced_accuracy': np.mean(cv_results['test_balanced_accuracy']),
-        'accuracy': np.mean(cv_results['test_accuracy']),
-        'precision': np.mean(cv_results['test_precision']),
-        'recall': np.mean(cv_results['test_recall']),
-        'f1': np.mean(cv_results['test_f1']),
+    scoring = {
+        "accuracy": "accuracy",
+        "balanced_accuracy": "balanced_accuracy",
+        "precision": "precision",
+        "recall": "recall",
+        "mcc": mcc_scorer,
+        "f1": "f1",
+        "ece": ece_scorer,
     }
 
-    # Fit on full training set
-    pipe.fit(X_train.cpu(), y_train.cpu())
+    X_tr = X_train.cpu() if hasattr(X_train, "cpu") else X_train
+    y_tr = y_train.cpu() if hasattr(y_train, "cpu") else y_train
 
-    # Test set predictions
-    y_pred = pipe.predict(X_test.cpu())
-    y_prob = pipe.predict_proba(X_test.cpu())[:, 1] if len(np.unique(y_train.cpu())) == 2 else None  # binary case
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning)
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
+        warnings.filterwarnings("ignore", category=FutureWarning)
+        warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
 
-    # Collect final metrics on test set
+        if groups is not None:
+            cv = StratifiedGroupKFold(n_splits=n_splits)
+            cv_results = cross_validate(pipe, X_tr, y_tr, cv=cv, groups=groups,
+                                        scoring=scoring, return_train_score=False)
+        else:
+            cv_results = cross_validate(pipe, X_tr, y_tr, cv=n_splits,
+                                        scoring=scoring, return_train_score=False)
+
+    cv_accuracy_scores = {
+        "mcc": np.mean(cv_results["test_mcc"]),
+        "balanced_accuracy": np.mean(cv_results["test_balanced_accuracy"]),
+        "accuracy": np.mean(cv_results["test_accuracy"]),
+        "precision": np.mean(cv_results["test_precision"]),
+        "recall": np.mean(cv_results["test_recall"]),
+        "f1": np.mean(cv_results["test_f1"]),
+        "ece": -np.mean(cv_results["test_ece"]),
+    }
+
+    pipe.fit(X_tr, y_tr)
+
+    X_te = X_test.cpu() if hasattr(X_test, "cpu") else X_test
+    y_te = y_test.cpu() if hasattr(y_test, "cpu") else y_test
+
+    y_pred = pipe.predict(X_te)
+    y_prob = pipe.predict_proba(X_te)[:, 1] if len(np.unique(y_tr)) == 2 else None
+
     test_accuracy_scores = {
-        'mcc': matthews_corrcoef(y_test.cpu(), y_pred),
-        'accuracy': accuracy_score(y_test.cpu(), y_pred),
-        'balanced_accuracy': balanced_accuracy_score(y_test.cpu(), y_pred),
-        'precision': precision_score(y_test.cpu(), y_pred, zero_division=0),
-        'recall': recall_score(y_test.cpu(), y_pred, zero_division=0),
-        'f1': f1_score(y_test.cpu(), y_pred, zero_division=0),
+        "mcc": matthews_corrcoef(y_te, y_pred),
+        "accuracy": accuracy_score(y_te, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_te, y_pred),
+        "precision": precision_score(y_te, y_pred, zero_division=0),
+        "recall": recall_score(y_te, y_pred, zero_division=0),
+        "f1": f1_score(y_te, y_pred, zero_division=0),
+        "ece": expected_calibration_error(y_te, y_prob) if y_prob is not None else float("nan"),
     }
     return cv_accuracy_scores, test_accuracy_scores
 
-import random
-def xgboost_accur_select_features(X_train, X_test, y_train, y_test, sorted_indices, feat_step, device, feat_removal = False, train_test_feat_apply = True, groups=None):
-    cv_accur_arr = []
-    test_accur_arr = []
- 
-    num_feat = range(1,len(sorted_indices),feat_step)
+
+# Feature-addition / removal curves
+
+def xgboost_accur_select_features(
+    X_train, X_test, y_train, y_test,
+    sorted_indices, feat_step, device, split_id,
+    add_rem_noise_rates,
+    feat_removal: bool = False,
+    train_test_feat_apply: bool = True,
+    groups=None,
+    fully_remove_feat_info: bool = False,
+):
+    """
+    Sweep over feature subsets (adding or removing in SHAP order) and record
+    CV and test metrics at each step.
+    """
+    cv_accur_arr, test_accur_arr = [], []
+
+    cutoff = 30
+    indices = (
+        list(range(1, min(cutoff, len(sorted_indices))))
+        + list(range(cutoff, len(sorted_indices), feat_step))
+    )
     num_feat_plot = []
-    for N in num_feat:
-        
-        if feat_removal == False:
-            select_feat = list(sorted_indices[:N])
+
+    for N in indices:
+        select_feat = list(sorted_indices[:N]) if not feat_removal else list(sorted_indices[N:])
+        num_feat_plot.append(N)
+
+        if train_test_feat_apply:
+            X_train_sel = X_train[:, select_feat]
+            X_test_sel = X_test[:, select_feat]
+
+            if add_rem_noise_rates is not None:
+                add_rate, rem_rate = add_rem_noise_rates
+                X_test_sel = flip_with_fractional_noise(  # noqa: F821 – defined externally
+                    X_test_sel, add_rate, rem_rate, noise_std=0.3, hard_fn_flag=True
+                )
         else:
-            select_feat = list(sorted_indices[N:])
-      #  select_feat = random.sample(sorted_indices, N)  
-       # print(select_feat)
-        num_feat_plot.append(N) 
+            X_train_sel = X_train.clone() if hasattr(X_train, "clone") else X_train.copy()
+            X_test_sel = X_test.clone() if hasattr(X_test, "clone") else X_test.copy()
 
-        if train_test_feat_apply == True:
-            X_train_select_feat = X_train[:, select_feat] 
-            X_test_select_feat = X_test[:, select_feat]
-        else:
-            X_train_select_feat = X_train.clone()  
-            X_test_select_feat = X_test.clone()
-            X_test_select_feat[:, select_feat] = 0
+            import torch
+            all_features = torch.arange(X_test.shape[1])
+            unselected = all_features[~torch.isin(all_features, torch.tensor(select_feat))]
+            X_test_sel[:, unselected] = np.nan if fully_remove_feat_info else 0
 
+            if add_rem_noise_rates is not None:
+                add_rate, rem_rate = add_rem_noise_rates
+                X_test_sel[:, select_feat] = flip_with_fractional_noise(  # noqa: F821
+                    X_test_sel[:, select_feat], add_rate, rem_rate, noise_std=0.3, hard_fn_flag=True
+                )
 
-        cv_accuracy_scores, test_accuracy_scores = xgboost_train_accur(X_train_select_feat, y_train, X_test_select_feat, y_test, device, groups=groups)
-        cv_accur_arr.append(cv_accuracy_scores)
-        test_accur_arr.append(test_accuracy_scores)
-
-    return cv_accur_arr,  test_accur_arr, num_feat_plot 
-
-
-def mutual_info_features(X_train, y_train, X_train_column_names, random_state, contin_flag = False):
-    if contin_flag == False:
-        mutual_info = mutual_info_classif(X_train, y_train, random_state=random_state)
-    else:
-        mutual_info = mutual_info_regression(X_train, y_train, random_state=random_state)
-    
-    sorted_indices = np.argsort(mutual_info)[::-1] 
-    sorted_mi = [mutual_info[i] for i in sorted_indices]
-    sorted_names = [X_train_column_names[i] for i in sorted_indices]
-
-    return sorted_indices, sorted_mi, sorted_names
-
-def random_forest_features(X_train, y_train, X_train_column_names, random_state, contin_flag = False):
-
-    if contin_flag == False:
-        # Train a Random Forest model
-        rf = RandomForestClassifier(n_estimators=100, random_state=random_state)
-    else:    
-        rf = RandomForestRegressor(n_estimators=100, random_state=random_state)
-
-    rf.fit(X_train, y_train)
-
-    # Get feature importances
-    importances = rf.feature_importances_
-    # print("Feature importances:", importances)
-    # print(len(importances))
-
-    # Select features based on importance threshold
-    selector = SelectFromModel(rf, threshold='mean', prefit=True)
-    X_selected = selector.transform(X_train)
-
-    print(f"Original feature count: {X_train.shape[1]}, Selected feature count: {X_selected.shape[1]}")
-    
-
-    # plt.figure(figsize=(10, 2))
-    # plt.bar(range(X_train.shape[1]), importances)
-    # plt.xlabel("Feature Index")
-    # plt.ylabel("Importance")
-    # plt.ylim([0, max(importances)])
-    # plt.show()
-
-    sorted_indices = np.argsort(importances)[::-1]  # Reverse the order to get descending sort
-
-    # Step 2: Use the sorted indices to get the sorted importances and corresponding names
-    sorted_importances = [importances[i] for i in sorted_indices]
-    sorted_names = [X_train_column_names[i] for i in sorted_indices]
-
-    return sorted_indices, sorted_importances, sorted_names
-
-# --- 1. Label each sample as low, mid, or high OGT group
-def label_ogt_range(y,high_thresh=45):
-    labels = []
-    for val in y:
-        if val < high_thresh:
-            labels.append('low')
-        else:
-            labels.append('high')
-    return np.array(labels)
-
-from sklearn.preprocessing import LabelEncoder
-from sklearn.utils.class_weight import compute_class_weight
-
-import shap
-import numpy as np
-from xgboost import XGBClassifier, XGBRegressor
-from sklearn.pipeline import make_pipeline
-
-def shap_features(X_train, y_train, X_column_names, device, contin_flag=False):
-    if not contin_flag:
-        model = XGBClassifier(
-            n_jobs=None if device != "cpu" else -1,
-            tree_method="gpu_hist" if device != "cpu" else "hist",
-            eval_metric="logloss"
+        cv_scores, test_scores = xgboost_train_accur(
+            X_train_sel, y_train, X_test_sel, y_test, device, groups=groups
         )
-    else:
-        model = XGBRegressor(
-            n_estimators=100,
-            max_depth=5,
-            learning_rate=0.05,
-            n_jobs=-1,
-            tree_method="gpu_hist" if device != "cpu" else "hist",
+        cv_accur_arr.append(cv_scores)
+        test_accur_arr.append(test_scores)
+
+    return cv_accur_arr, test_accur_arr, num_feat_plot
+
+
+def shap_curves_file(
+    train_test_feat_apply_flag, filename, feat_step, feat_removal,
+    all_splits_dict, add_rem_noise_rates=None, fully_remove_feat_info=False,
+):
+    """Load cached accuracy curves from disk, or compute and save them."""
+    if os.path.exists(filename):
+        with open(filename, "rb") as f:
+            results = pickle.load(f)
+        print(f"Loaded existing results from {filename}")
+        return results
+
+    print("No existing file found. Computing from scratch...")
+    results = defaultdict(dict)
+
+    for split_id in all_shap_lists_dict.keys():  # noqa: F821 – module-level global
+        if all_splits_dict[int(split_id)] == 0:
+            continue
+
+        split = all_splits_dict[int(split_id)]
+        X_train = split["X_train"]
+        y_train = split["y_train"]
+        X_test  = split["X_test"]
+        y_test  = split["y_test"]
+        col_names = list(split["feature_names"])
+        groups = split["taxa_group_names_train"]
+
+        shap_list = all_shap_lists_dict[split_id]  # noqa: F821
+        indices = [col_names.index(f) for f in shap_list if f in col_names]
+
+        cv_arr, test_arr, num_feat = xgboost_accur_select_features(
+            X_train.cpu(), X_test.cpu(), y_train.cpu(), y_test.cpu(),
+            indices, feat_step, DEVICE,  # noqa: F821 – module-level global
+            split_id, add_rem_noise_rates,
+            feat_removal, train_test_feat_apply_flag,
+            groups=groups,
+            fully_remove_feat_info=fully_remove_feat_info,
         )
 
-    # convert to numpy if torch
-    if hasattr(X_train, "cpu"):
-        X_np = X_train.cpu().numpy()
-        y_np = y_train.cpu().numpy()
-    else:
-        X_np, y_np = X_train, y_train
+        results[split_id]["cv_accur"]   = cv_arr
+        results[split_id]["test_accur"] = test_arr
+        results[split_id]["num_feat"]   = num_feat
+        print(f"  Split {split_id} done")
 
-    # fit model
-    model.fit(X_np, y_np)
-
-    # use TreeExplainer (much faster & correct for XGB)
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X_np)
-
-    # if classifier, shap_values is a list (per class)
-    if not contin_flag and isinstance(shap_values, list):
-        shap_values = shap_values[1]  # take class 1 SHAP values
-
-    # feature importances
-    abs_shap_vals = np.abs(shap_values)
-    mean_abs_shap_vals = np.mean(abs_shap_vals, axis=0)
-
-    sorted_indices = np.argsort(mean_abs_shap_vals)[::-1]
-    sorted_importances = mean_abs_shap_vals[sorted_indices]
-    sorted_names = [X_column_names[i] for i in sorted_indices]
-
-    return sorted_indices, sorted_importances, sorted_names, shap_values
+    with open(filename, "wb") as f:
+        pickle.dump(results, f)
+    return results
 
 
-       #  shap_vals_contin = defaultdict(list)
-
-       #  X_np = X_train.cpu().numpy()
-
-       #  range_labels = label_ogt_range(y_train)
-       #  le = LabelEncoder()
-       #  range_ids = le.fit_transform(range_labels)  # Converts to 0,1,2
-       #  range_ids_np = range_ids if isinstance(range_ids, np.ndarray) else range_ids.cpu().numpy()
-        
-       #  gating_model = XGBClassifier(
-       #      n_jobs=-1,
-       #      tree_method=tree_method,
-       #      device=device,
-       #      #predictor=predictor,
-       #      objective="binary:logistic",
-       #      eval_metric="logloss"
-       #  )
-       #  label_to_int = {'low': 0, 'high': 1}
-       #  range_ids = np.vectorize(label_to_int.get)(range_labels)
-    
-       #  classes = np.unique(range_ids)
-       #  weights = compute_class_weight(class_weight='balanced', classes=classes, y=range_ids)
-       #  class_weights = dict(zip(classes, weights))
-       #  #class_weights[0]=1
-       # # class_weights[1]=10
-       #  sample_weights = np.array([class_weights[c] for c in range_ids])
-        
-       #  gating_model.fit(X_np, range_ids_np, sample_weight=sample_weights)
-       #  # SHAP
-       #  explainer = shap.Explainer(model, X_np)  # can also use shap.TreeExplainer(model)
-       #  shap_values = explainer(X_np)
-    
-       #  # 5. Extract SHAP values and compute mean absolute SHAP value per feature
-       #  shap_vals = shap_values.values  # shape: [n_samples, n_features]
-       #  abs_shap_vals = np.abs(shap_vals)
-       #  mean_abs_shap_vals = np.mean(abs_shap_vals, axis=0)
-    
-       #  # 6. Sort features by importance
-       #  sorted_indices = np.argsort(mean_abs_shap_vals)[::-1]
-       #  sorted_importances = mean_abs_shap_vals[sorted_indices]
-       #  sorted_names = [X_column_names[i] for i in sorted_indices]
-       #  local_dict = defaultdict(list) 
-       #  local_dict["sorted_indices"] = sorted_indices
-       #  local_dict["sorted_importances"] = sorted_importances
-       #  local_dict["sorted_names"] = sorted_names
-       #  shap_vals_contin["gating_model"] = local_dict
-       #  #REgression
-       #  y_train = y_train.squeeze()
-        
-       #  temp_bound = 45
-       #  # Define masks (all 1D)
-       #  low_mask  = y_train < temp_bound
-       #  high_mask = y_train >= temp_bound
-    
-       #  # Apply masks correctly
-       #  X_low, y_low   = X_train[low_mask].cpu(), y_train[low_mask].cpu()
-       #  X_high, y_high = X_train[high_mask].cpu(), y_train[high_mask].cpu()
-    
-       #  model_low  = XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.05).fit(X_low, y_low)
-       #  model_high =  XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.05).fit(X_high, y_high)
-
-       #  explainer_low = shap.Explainer(model_low)
-       #  shap_values_low = explainer_low(X_val_low)
-
-       #  explainer_high = shap.Explainer(model_high)
-       #  shap_values_high = explainer_high(X_val_high)
-
-        
-
-        
-def svc_features(X_train, y_train, X_train_column_names):
-    scaler = MaxAbsScaler()
-
-    X_train_scaled = scaler.fit_transform(X_train)
-    #X_test_scaled = scaler.transform(X_test)
-
-    # Step 3: Fit the LinearSVC model with L1 penalty (for feature selection)
-    svm = LinearSVC(C=0.01, penalty='l1', dual=False, max_iter=5000)
-    svm.fit(X_train, y_train)
-
-    # Step 4: Extract the absolute feature importance (model coefficients)
-    feature_importance = np.abs(svm.coef_.ravel())
-
-    # Step 5: Sort the indices by feature importance (from highest to lowest)
-    sorted_indices = np.argsort(feature_importance)[::-1]  # Reverse order for descending
-
-    sorted_importances = [feature_importance[i] for i in sorted_indices]
-    sorted_names = [X_train_column_names[i] for i in sorted_indices]
-
-    return sorted_indices, sorted_importances, sorted_names
-
-
-def plot_accuracy_metric11(metric, test_accuracy_scores, cv_accuracy_scores, test_accur_arr, test_accur_arr_rem, cv_accur_arr, cv_accur_arr_rem, num_feat, n_cols):
-    plt.axhline(y=test_accuracy_scores[metric], color='darkred', linestyle='--', linewidth=1.5, label='baseline test')
-    plt.axhline(y=cv_accuracy_scores[metric], color='darkblue', linestyle='--', linewidth=1.5, label='baseline CV')
-
-    plt.plot(num_feat, [scores[metric] for scores in test_accur_arr], c = "tab:red", label = "test | add")
-    plt.plot(num_feat, [scores[metric] for scores in cv_accur_arr], c = "tab:blue", label = "cv | add")
-
-    plt.plot([n_cols - n_feat for n_feat in num_feat],  [scores[metric] for scores in test_accur_arr_rem], c = "tab:red", label = "test | remove", alpha = 0.5)
-    plt.plot([n_cols - n_feat for n_feat in num_feat], [scores[metric] for scores in cv_accur_arr_rem], c = "tab:blue", label = "cv | remove", alpha = 0.5)
-
-    plt.xlabel("number of features added/removed")
-    plt.ylabel(metric)
-    plt.ylim(0.0, 1.1)
-
-def make_cog_descr(df):
-    """
-    Get descriptions for COGs from NCBI.
-    
-    :param pd.DataFrame cogs_df: pandas dataframe with top COGs from MI, RandomForest, and SHAP feature selection
-    :return: pandas.DataFrame
-    """
-    cogs_df = df.copy()
-
-    url = 'https://ftp.ncbi.nlm.nih.gov/pub/COG/COG2024/data/cog-24.def.tab'
-    response = requests.get(url)
-    
-    data_lines = response.content.decode('utf-8').splitlines()
-    cogs_descr = pd.DataFrame([line.split('\t') for line in data_lines if len(line.split('\t')) == 7],
-                              columns=['COG_ID', 'Category', 'Description', 'Gene', 'Function', 'Gene_IDs', 'PDB_ID'])
-
-    for column in ['MI', 'RandomForest', 'SHAP']:
-        df_descr = pd.merge(cogs_df, cogs_descr[['COG_ID', 'Description']], 
-                            how='left', left_on=[column], right_on=['COG_ID'], 
-                            suffixes=('', f'_{column}'))
-        cogs_df[column] = cogs_df[column] + ': ' + df_descr[f'Description'].fillna('')
-
-    return cogs_df[['MI', 'RandomForest', 'SHAP']]
-
-import copy
 def random_feat_removal_curves(X_train, X_test, y_train, y_test, num_runs, feat_step, device, feat_removal, groups=None):
-    tot_num_feat = X_train.cpu().shape[1]
-    num_feat = range(1,tot_num_feat,feat_step)
-    accuracy_one_point_arr = {
-        'mcc': [],
-        'balanced_accuracy':  [],
-        'accuracy':  [],
-        'precision': [],
-        'recall': [],
-        'f1': [],
-        'roc_auc': [],
-    }
-    cv_accur_arr_all_runs = [copy.deepcopy(accuracy_one_point_arr) for _ in num_feat]
-    test_accur_arr_all_runs = [copy.deepcopy(accuracy_one_point_arr) for _ in num_feat]
+    """Run feature-sweep experiments with randomly shuffled feature orderings."""
+    X_tr = X_train.cpu() if hasattr(X_train, "cpu") else X_train
+    tot_num_feat = X_tr.shape[1]
+    num_feat = list(range(1, tot_num_feat, feat_step))
+
+    empty_point = {m: [] for m in ("mcc", "balanced_accuracy", "accuracy", "precision", "recall", "f1")}
+    cv_runs  = [copy.deepcopy(empty_point) for _ in num_feat]
+    test_runs = [copy.deepcopy(empty_point) for _ in num_feat]
+    test_curves_per_run, cv_curves_per_run = [], []
 
     for i in range(num_runs):
-        print(f"Processing random feature combo {i}")
-       # shuffled_indices = np.random.permutation(tot_num_feat)
-        cv_accur_arr, test_accur_arr, num_feat = xgboost_accur_select_features(X_train, X_test, y_train, y_test, list(range(X_train.shape[1])), feat_step, device, feat_removal, groups=groups)
-        for j in range(len(num_feat)):
-            for metric in cv_accur_arr[j].keys():
-                cv_accur_arr_all_runs[j][metric].append(cv_accur_arr[j][metric])
-                test_accur_arr_all_runs[j][metric].append(test_accur_arr[j][metric])
-                
-    accuracy_one_point_val = {
-        'mcc': 0,
-        'balanced_accuracy':  0,
-        'accuracy':  0,
-        'precision': 0,
-        'recall': 0,
-        'f1': 0,
-        'roc_auc': 0,
-    }
-    cv_accur_arr_all_runs_mn = [copy.deepcopy(accuracy_one_point_val) for _ in num_feat]
-    cv_accur_arr_all_runs_std = [copy.deepcopy(accuracy_one_point_val) for _ in num_feat]
-    test_accur_arr_all_runs_mn = [copy.deepcopy(accuracy_one_point_val) for _ in num_feat]
-    test_accur_arr_all_runs_std = [copy.deepcopy(accuracy_one_point_val) for _ in num_feat]
+        print(f"Random permutation run {i + 1}/{num_runs}")
+        shuffled = np.random.permutation(tot_num_feat)
+        cv_arr, test_arr, _ = xgboost_accur_select_features(
+            X_train, X_test, y_train, y_test,
+            shuffled, feat_step, device, split_id=None,
+            add_rem_noise_rates=None, feat_removal=feat_removal, groups=groups,
+        )
+        test_curves_per_run.append(copy.deepcopy(test_arr))
+        cv_curves_per_run.append(copy.deepcopy(cv_arr))
 
-    for j in range(len(num_feat)):
-        for metric in cv_accur_arr_all_runs_mn[j].keys():
-            cv_accur_arr_all_runs_mn[j][metric] = np.mean(cv_accur_arr_all_runs[j][metric])
+        for j, (cv_s, test_s) in enumerate(zip(cv_arr, test_arr)):
+            for metric in empty_point:
+                cv_runs[j][metric].append(cv_s[metric])
+                test_runs[j][metric].append(test_s[metric])
 
-        for metric in cv_accur_arr_all_runs_std[j].keys():
-            cv_accur_arr_all_runs_std[j][metric] = np.std(cv_accur_arr_all_runs[j][metric])
+    def _summarise(runs):
+        mn  = [{m: np.mean(runs[j][m]) for m in empty_point} for j in range(len(num_feat))]
+        std = [{m: np.std(runs[j][m])  for m in empty_point} for j in range(len(num_feat))]
+        return mn, std
 
-        for metric in test_accur_arr_all_runs_mn[j].keys():
-            test_accur_arr_all_runs_mn[j][metric] = np.mean(test_accur_arr_all_runs[j][metric])
-
-        for metric in test_accur_arr_all_runs_std[j].keys():
-            test_accur_arr_all_runs_std[j][metric] = np.std(test_accur_arr_all_runs[j][metric])
-    return cv_accur_arr_all_runs_mn, cv_accur_arr_all_runs_std, test_accur_arr_all_runs_mn, test_accur_arr_all_runs_std, num_feat
-
-def plot_accuracy_metric(baseline_test, baseline_cv, vary_test, vary_cv, rand_mean_test, rand_std_test, rand_mean_cv, rand_std_cv, num_feat_plot):
-    rand_mean_test, rand_std_test = np.array(rand_mean_test), np.array(rand_std_test)
-    rand_mean_cv, rand_std_cv = np.array(rand_mean_cv), np.array(rand_std_cv)
-    plt.axhline(y=baseline_test, color='darkred', linestyle='--', linewidth=1, label='test baseline')
-    plt.axhline(y=baseline_cv, color='darkblue', linestyle='--', linewidth=1, label='cv baseline')
-    plt.plot(num_feat_plot, vary_test, c = "tab:red", alpha = 1, label = "test varying features", linewidth=1)
-    plt.plot(num_feat_plot, vary_cv, c = "tab:blue", alpha = 1, label = "cv varying features", linewidth=1)
-    plt.plot(num_feat_plot, rand_mean_test, label="test random, mean ± std", color='tab:orange', linewidth=1)
-    plt.fill_between(num_feat_plot, rand_mean_test - rand_std_test, rand_mean_test + rand_std_test, alpha=0.3, color='tab:orange')
-    plt.plot(num_feat_plot, rand_mean_cv, label="cv random, mean ± std", color='tab:green', linewidth=1)
-    plt.fill_between(num_feat_plot, rand_mean_cv - rand_std_cv, rand_mean_cv + rand_std_cv, alpha=0.3, color='tab:green')
-    plt.grid()
+    cv_mn, cv_std     = _summarise(cv_runs)
+    test_mn, test_std = _summarise(test_runs)
+    return cv_mn, cv_std, test_mn, test_std, num_feat, test_curves_per_run, cv_curves_per_run
 
 
+# Restricted feature-space evaluation (Markov Blanket experiments)
+
+def find_accuracies_on_restricted_feat_space(
+    all_splits_dict, all_markov_bound_dict_with_res, X_column_names, feature_condit, device
+):
+    """Evaluate classifier accuracy on feature subsets defined by Markov Blankets."""
+    cv_splits   = defaultdict(list)
+    test_splits = defaultdict(list)
+    print("Processing splits...")
+
+    for split_id in all_markov_bound_dict_with_res.keys():
+        sid = str(split_id)
+        split = all_splits_dict[int(sid)]
+        X_train = split["X_train"]
+        y_train = split["y_train"]
+        X_test  = split["X_test"]
+        y_test  = split["y_test"]
+        groups  = split["taxa_group_names_train"]
+        mbs     = all_markov_bound_dict_with_res[sid]["MB"]
+
+        in_mb  = [i for i, v in enumerate(X_column_names) if v in mbs]
+        out_mb = [i for i, v in enumerate(X_column_names) if v not in mbs]
+
+        def _zeroed_test(mask_indices):
+            X_mod = X_test.clone() if hasattr(X_test, "clone") else X_test.copy()
+            X_mod[:, mask_indices] = np.nan
+            return X_mod
+
+        if feature_condit == "mb_train_test":
+            cv_s, test_s = xgboost_train_accur(X_train[:, in_mb], y_train, X_test[:, in_mb], y_test, device, groups=groups)
+        elif feature_condit == "mb_zero_test":
+            cv_s, test_s = xgboost_train_accur(X_train, y_train, _zeroed_test(in_mb), y_test, device, groups=groups)
+        elif feature_condit == "full":
+            cv_s, test_s = xgboost_train_accur(X_train, y_train, X_test, y_test, device, groups=groups)
+        elif feature_condit == "no_mb_train_test":
+            cv_s, test_s = xgboost_train_accur(X_train[:, out_mb], y_train, X_test[:, out_mb], y_test, device, groups=groups)
+        elif feature_condit == "no_mb_test":
+            cv_s, test_s = xgboost_train_accur(X_train, y_train, _zeroed_test(out_mb), y_test, device, groups=groups)
+        else:
+            raise ValueError(f"Unknown feature_condit: {feature_condit!r}")
+
+        for m in cv_s:
+            cv_splits[m].append(cv_s[m])
+            test_splits[m].append(test_s[m])
+
+    def _agg(splits):
+        return (
+            {m: np.mean(splits[m]) for m in splits},
+            {m: np.std(splits[m])  for m in splits},
+        )
+
+    cv_mn, cv_std     = _agg(cv_splits)
+    test_mn, test_std = _agg(test_splits)
+    print("Done!")
+    return cv_mn, cv_std, test_mn, test_std
 
 
+# Feature importance methods
 
-import numpy as np
-from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
-from sklearn.metrics import mutual_info_score
-from collections import defaultdict
-from functools import lru_cache
-from joblib import Parallel, delayed
-from tqdm import tqdm
+def mutual_info_features(X_train, y_train, X_train_column_names, random_state, contin_flag=False):
+    """Rank features by mutual information with the target."""
+    mi = (mutual_info_regression if contin_flag else mutual_info_classif)(
+        X_train, y_train, random_state=random_state
+    )
+    idx = np.argsort(mi)[::-1]
+    return idx, [mi[i] for i in idx], [X_train_column_names[i] for i in idx]
 
 
-def group_by_z(z):
-    """Group indices by unique rows in z."""
-    keys = [tuple(row) for row in z]
+def random_forest_features(X_train, y_train, X_train_column_names, random_state, contin_flag=False):
+    """Rank features by Random Forest impurity importance."""
+    Cls = RandomForestRegressor if contin_flag else RandomForestClassifier
+    rf = Cls(n_estimators=100, random_state=random_state).fit(X_train, y_train)
+
+    sel = SelectFromModel(rf, threshold="mean", prefit=True)
+    n_sel = sel.transform(X_train).shape[1]
+    print(f"Original: {X_train.shape[1]} features → selected: {n_sel}")
+
+    idx = np.argsort(rf.feature_importances_)[::-1]
+    return idx, [rf.feature_importances_[i] for i in idx], [X_train_column_names[i] for i in idx]
+
+
+def shap_features(X_train, y_train, X_column_names, device, contin_flag=False):
+    """
+    Rank features by mean absolute SHAP value using XGBoost's native SHAP output.
+
+    Works for both classification (contin_flag=False) and regression (contin_flag=True).
+
+    Returns
+    -------
+    sorted_indices, sorted_importances, sorted_names, feature_shap_values
+    """
+    use_gpu = device != "cpu"
+    kwargs = dict(tree_method="hist", device="cuda" if use_gpu else "cpu")
+
+    model = (
+        XGBRegressor(n_estimators=100, max_depth=5, learning_rate=0.05, n_jobs=-1, **kwargs)
+        if contin_flag
+        else XGBClassifier(n_jobs=None if use_gpu else -1, eval_metric="logloss",
+                           use_label_encoder=False, **kwargs)
+    )
+
+    X_np = X_train.cpu().numpy() if hasattr(X_train, "cpu") else np.asarray(X_train)
+    y_np = y_train.cpu().numpy() if hasattr(y_train, "cpu") else np.asarray(y_train)
+
+    model.fit(X_np, y_np)
+
+    shap_vals = model.get_booster().predict(xgb.DMatrix(X_np, label=y_np), pred_contribs=True)
+    shap_vals = np.asarray(shap_vals)[:, :-1]  # drop bias column
+
+    mean_abs = np.abs(shap_vals).mean(axis=0)
+    idx = np.argsort(mean_abs)[::-1]
+    return idx, mean_abs[idx], [X_column_names[i] for i in idx], shap_vals
+
+
+def svc_features(X_train, y_train, X_train_column_names):
+    """Rank features by L1-penalised LinearSVC coefficient magnitude."""
+    MaxAbsScaler().fit_transform(X_train)  # scaling kept for parity; not passed to SVC
+    svm = LinearSVC(C=0.01, penalty="l1", dual=False, max_iter=5000).fit(X_train, y_train)
+    imp = np.abs(svm.coef_.ravel())
+    idx = np.argsort(imp)[::-1]
+    return idx, [imp[i] for i in idx], [X_train_column_names[i] for i in idx]
+
+
+def shap_topN_frequency(shap_dict: dict, top_n: int) -> Counter:
+    """
+    Count how often each feature appears in the top-N SHAP features across splits.
+
+    Parameters
+    ----------
+    shap_dict : dict
+        ``{split_id: [feature_1, feature_2, ...]}`` ranked by SHAP importance.
+    top_n : int
+        Number of top features to consider per split.
+
+    Returns
+    -------
+    Counter
+        feature → frequency across splits.
+    """
+    counter: Counter = Counter()
+    for features in shap_dict.values():
+        counter.update(features[:top_n])
+    return counter
+
+
+# Accuracy-curve helpers
+
+def accur_curves(accuracy_curves_all_splits_add_feat):
+    """Unpack per-split accuracy-curve dicts into metric arrays."""
+    bal_accur, recall, mcc, f1, num_feat = [], [], [], [], []
+    for val in accuracy_curves_all_splits_add_feat.values():
+        ba, re, mc, f = [], [], [], []
+        for pt in val["test_accur"]:
+            ba.append(pt["balanced_accuracy"])
+            re.append(pt["recall"])
+            mc.append(pt["mcc"])
+            f.append(pt["f1"])
+        bal_accur.append(ba)
+        recall.append(re)
+        mcc.append(mc)
+        f1.append(f)
+        num_feat.append(val["num_feat"])
+    return bal_accur, recall, mcc, f1, num_feat
+
+
+def accur_curves_regr(accuracy_curves_all_splits_add_feat):
+    """Unpack regression accuracy curves (R² and RMSE)."""
+    r2, rmse, num_feat = [], [], []
+    for val in accuracy_curves_all_splits_add_feat.values():
+        r2.append([pt["r2"]   for pt in val["test_accur"]])
+        rmse.append([pt["rmse"] for pt in val["test_accur"]])
+        num_feat.append(val["num_feat"])
+    return r2, rmse, num_feat
+
+
+def find_mean_std_curve(curves):
+    """Compute element-wise mean and std across curves, truncated to the shortest."""
+    min_len = min(len(c) for c in curves)
+    arr = np.array([c[:min_len] for c in curves])
+    return arr.mean(axis=0), arr.std(axis=0)
+
+
+def find_decreas_curve_index(mean_curve, x_vals, thresh_percent=0.95, stability=5):
+    """
+    Return the x-value at which a curve first drops to ≤ thresh_percent of its
+    starting value and stays there for `stability` consecutive steps.
+    """
+    y = np.asarray(mean_curve)
+    threshold = thresh_percent * y[0]
+    for i in range(len(y) - stability + 1):
+        if np.all(y[i:i + stability] <= threshold):
+            return x_vals[i]
+    return None
+
+
+def find_increas_curve_index(mean_curve, x_vals, thresh_percent=0.95):
+    """Return the x-value at which a curve first reaches thresh_percent of its maximum."""
+    y = np.asarray(mean_curve)
+    idx = np.where(y >= thresh_percent * y[-1])[0][0]
+    return x_vals[idx]
+
+
+def find_mean_std_index_for_curves(curves, x_vals):
+    """Return drop-off indices for each individual curve."""
+    return [
+        ind for curve in curves
+        if (ind := find_decreas_curve_index(curve, x_vals)) is not None
+    ]
+
+# Conditional mutual information / IAMB
+
+def _group_by_z(z):
     groups = defaultdict(list)
-    for idx, key in enumerate(keys):
+    for idx, key in enumerate(map(tuple, z)):
         groups[key].append(idx)
     return groups
 
 
-@lru_cache(maxsize=None)
-def conditional_mutual_info_cached(x_bytes, y_bytes, z_bytes, contin):
-    """Wrapper for caching CMI calculations using hashable inputs."""
-    x = np.frombuffer(x_bytes, dtype=np.float64)
-    y = np.frombuffer(y_bytes, dtype=np.float64)
-    z = np.frombuffer(z_bytes, dtype=np.float64).reshape(-1, z_dim[0]) if z_bytes else np.array([])
-
-    return conditional_mutual_info(x, y, z, contin)
-
-
-def conditional_mutual_info(x, y, z, contin):
-    """Estimate conditional mutual information I(x; y | z)"""
+def conditional_mutual_info(x, y, z, contin: bool):
+    """Estimate I(x ; y | z) via discretised or continuous MI."""
     x = np.asarray(x)
     y = np.asarray(y).ravel()
 
-    if not contin:  # categorical
-        x = x.astype(int)
-        y = y.astype(int)
+    if not contin:
+        x, y = x.astype(int), y.astype(int)
         if z.size == 0:
             return mutual_info_score(x, y)
-
-        z = z.astype(int)
-        groups = group_by_z(z)
-        cmi = 0
-        for indices in groups.values():
-            if len(indices) <= 1:
-                continue
-                
-            p_z = len(indices) / len(x)
-            p_xy_z = mutual_info_score(x[indices], y[indices])
-            cmi += p_z * p_xy_z
+        cmi = 0.0
+        for idxs in _group_by_z(z.astype(int)).values():
+            if len(idxs) > 1:
+                cmi += (len(idxs) / len(x)) * mutual_info_score(x[idxs], y[idxs])
         return cmi
 
-    else:  # continuous
-        x = x.reshape(-1, 1) if x.ndim == 1 else x
-
-        if z.size == 0:
-            return mutual_info_regression(x, y)[0]
-
-        groups = group_by_z(z)
-
-        cmi = 0
-        for indices in groups.values():
-            if len(indices) <= 3:
-                continue
-                    
-            p_z = len(indices) / len(x)
-            x_vals = x[indices]
-            y_vals = y[indices]
-            p_xy_z = mutual_info_regression(x_vals, y_vals)[0]
-            cmi += p_z * p_xy_z
-        return cmi
+    x = x.reshape(-1, 1) if x.ndim == 1 else x
+    if z.size == 0:
+        return mutual_info_regression(x, y)[0]
+    cmi = 0.0
+    for idxs in _group_by_z(z).values():
+        if len(idxs) > 3:
+            cmi += (len(idxs) / len(x)) * mutual_info_regression(x[idxs], y[idxs])[0]
+    return cmi
 
 
-def compute_cmi_parallel(f, X, y, MB, contin):
-    z = X[list(MB)].values if MB else np.array([])
+def _compute_cmi_worker(f, X, y, mb_set, contin):
+    """Worker used by joblib for parallel CMI computation."""
+    z = X[list(mb_set)].values if mb_set else np.array([]).reshape(0, 0)
+    return f, conditional_mutual_info(X[f].values.astype(np.float64), y, z, contin)
 
-    # Convert to bytes for caching
-    x_bytes = X[f].values.astype(np.float64).tobytes()
-    y_bytes = y.astype(np.float64).tobytes()
-    z_bytes = z.astype(np.float64).tobytes() if z.size else b''
 
-    global z_dim
-    z_dim = z.shape[1:] if z.size else (0,)
-
-    cmi = conditional_mutual_info_cached(x_bytes, y_bytes, z_bytes, contin)
-    return f, cmi
-
-import warnings
-import re
 def iamb(X, y, contin=False, alpha=0.01, verbose=False, n_jobs=-1):
+    """
+    Incremental Association Markov Blanket (IAMB) algorithm.
 
-    warnings.filterwarnings(
-        "ignore",
-        category=FutureWarning,
-        message=re.escape("Your system has an old version of glibc (< 2.28).")
-    )
+    Parameters
+    ----------
+    X : pd.DataFrame
+        Feature matrix.
+    y : array-like
+        Target vector.
+    contin : bool
+        Use continuous MI estimator when True.
+    alpha : float
+        CMI threshold for add / remove decisions.
+    verbose : bool
+        Print progress.
+    n_jobs : int
+        Parallel workers (-1 = all CPUs).
 
-    MB = set()
+    Returns
+    -------
+    list
+        Selected feature names forming the Markov Blanket of y.
+    """
+    warnings.filterwarnings("ignore", category=FutureWarning,
+                            message=re.escape("Your system has an old version of glibc (< 2.28)."))
+
+    y = np.asarray(y)
+    MB: set = set()
     candidates = set(X.columns)
-    added = True
+    _wrap = lambda it, desc: tqdm(it, desc=desc, leave=False) if verbose else it  # noqa: E731
 
-    def maybe_tqdm(iterable, desc):
-        return tqdm(iterable, desc=desc, leave=False) if verbose else iterable
-
+    # Forward phase
     if verbose:
         print("=== FORWARD PHASE ===")
+    added = True
     while added:
         added = False
-        candidate_list = list(candidates - MB)
-
         results = Parallel(n_jobs=n_jobs)(
-            delayed(compute_cmi_parallel)(f, X, y, MB, contin)
-            for f in maybe_tqdm(candidate_list, desc="Evaluating CMI")
+            delayed(_compute_cmi_worker)(f, X, y, frozenset(MB), contin)
+            for f in _wrap(list(candidates - MB), "Evaluating CMI")
         )
-
-        mi_scores = {f: cmi for f, cmi in results}
-        if mi_scores:
-            best_feature = max(mi_scores, key=mi_scores.get)
-            if mi_scores[best_feature] > alpha:
-                MB.add(best_feature)
+        if results:
+            best, best_cmi = max(results, key=lambda r: r[1])
+            if best_cmi > alpha:
+                MB.add(best)
                 added = True
                 if verbose:
-                    print(f"  Added: {best_feature}, CMI={mi_scores[best_feature]:.4f}")
+                    print(f"  Added: {best}, CMI={best_cmi:.4f}")
 
+    # Backward phase
     if verbose:
         print("=== BACKWARD PHASE ===")
-
-    to_remove = []
     results = Parallel(n_jobs=n_jobs)(
-        delayed(compute_cmi_parallel)(f, X, y, MB - {f}, contin)
-        for f in maybe_tqdm(list(MB), desc="Checking removal")
+        delayed(_compute_cmi_worker)(f, X, y, frozenset(MB - {f}), contin)
+        for f in _wrap(list(MB), "Checking removal")
     )
-
     for f, cmi in results:
         if cmi < alpha:
-            to_remove.append((f, cmi))
-
-    for f, cmi in to_remove:
-        MB.remove(f)
-        if verbose:
-            print(f"  Removed: {f}, CMI={cmi:.4f}")
+            MB.discard(f)
+            if verbose:
+                print(f"  Removed: {f}, CMI={cmi:.4f}")
 
     return list(MB)
 
 
+# Mixture-of-experts regression model
 
+def label_ogt_range(y, high_thresh=45):
+    """Label samples as 'low' or 'high' based on OGT threshold."""
+    return np.where(np.asarray(y) < high_thresh, "low", "high")
+
+
+def xgboost_mixture_of_experts_2_class_cv_full(
+    X_train, y_train, range_ids, sample_weights, X_test, y_test,
+    n_splits=5, taxonomy_labels=None, cv_flag=False,
+):
+    """
+    Two-expert mixture model: a gating classifier routes samples to a
+    low-OGT or high-OGT XGBoost regressor.
+
+    Parameters
+    ----------
+    X_train, y_train : array-like
+        Training data (torch tensors or numpy).
+    range_ids : array-like
+        Binary gate labels (0 = low, 1 = high).
+    sample_weights : array-like
+        Per-sample weights for the gating model.
+    X_test, y_test : array-like
+        Held-out evaluation data.
+    n_splits : int
+        CV folds (used when cv_flag=True).
+    taxonomy_labels : array-like, optional
+        Group labels for GroupKFold.
+    cv_flag : bool
+        Whether to run cross-validation on the training set.
+
+    Returns
+    -------
+    dict
+        Keys: cv_predictions, cv_true, cv_gate_probs, test_predictions,
+              gating_model, gate_probs_test, cv_metrics, test_metrics.
+    """
+    temp_bound = 45
+
+    def _to_np(arr):
+        return arr.cpu().numpy() if hasattr(arr, "cpu") else np.asarray(arr)
+
+    X_tr_np  = _to_np(X_train)
+    y_tr_np  = _to_np(y_train).flatten()
+    X_te_np  = _to_np(X_test)
+    y_te_np  = _to_np(y_test).flatten()
+    w_np     = _to_np(sample_weights)
+    rid_np   = _to_np(range_ids)
+
+    tree_method = "hist"
+    xgb_device  = "cuda" if is_gpu_available() else "cpu"
+
+    xgb_kwargs   = dict(tree_method=tree_method, device=xgb_device)
+    gate_kwargs  = dict(**xgb_kwargs, objective="binary:logistic", eval_metric="logloss", n_jobs=-1)
+    expert_kwargs = dict(**xgb_kwargs, n_estimators=100, max_depth=5, learning_rate=0.05)
+
+    # ── Cross-validation ─────────────────────────────────────────────────────
+    n = len(y_tr_np)
+    final_cv_preds = np.zeros(n)
+    true_cv_vals   = np.zeros(n)
+    gate_probs_cv  = np.zeros((n, 2))
+    gate_preds_cv  = np.zeros(n, dtype=int)
+    gate_true_cv   = np.zeros(n, dtype=int)
+    cv_metrics: dict = {}
+
+    if cv_flag:
+        fold_gen = (
+            GroupKFold(n_splits=n_splits).split(X_tr_np, y_tr_np, groups=taxonomy_labels)
+            if taxonomy_labels is not None
+            else KFold(n_splits=n_splits, shuffle=True, random_state=42).split(X_tr_np, y_tr_np)
+        )
+
+        for tr_idx, val_idx in fold_gen:
+            X_tr, X_val = X_tr_np[tr_idx], X_tr_np[val_idx]
+            y_tr, y_val = y_tr_np[tr_idx], y_tr_np[val_idx]
+            w_tr, r_tr  = w_np[tr_idx], rid_np[tr_idx]
+
+            gate = XGBClassifier(**gate_kwargs).fit(X_tr, r_tr, sample_weight=w_tr)
+            gp_val = gate.predict_proba(X_val)
+            gp_cv_pred = np.argmax(gp_val, axis=1)
+
+            low_m, high_m = y_tr < temp_bound, y_tr >= temp_bound
+            p_low  = XGBRegressor(**expert_kwargs).fit(X_tr[low_m],  y_tr[low_m]).predict(X_val)
+            p_high = XGBRegressor(**expert_kwargs).fit(X_tr[high_m], y_tr[high_m]).predict(X_val)
+
+            final_cv_preds[val_idx] = gp_val[:, 0] * p_low + gp_val[:, 1] * p_high
+            true_cv_vals[val_idx]   = y_val
+            gate_probs_cv[val_idx]  = gp_val
+            gate_preds_cv[val_idx]  = gp_cv_pred
+            gate_true_cv[val_idx]   = (y_val >= temp_bound).astype(int)
+
+        cv_metrics = {
+            "accuracy":          accuracy_score(gate_true_cv, gate_preds_cv),
+            "balanced_accuracy": balanced_accuracy_score(gate_true_cv, gate_preds_cv),
+            "precision":         precision_score(gate_true_cv, gate_preds_cv),
+            "recall":            recall_score(gate_true_cv, gate_preds_cv),
+            "f1":                f1_score(gate_true_cv, gate_preds_cv),
+            "mcc":               matthews_corrcoef(gate_true_cv, gate_preds_cv),
+            "ece":               expected_calibration_error(gate_true_cv, gate_probs_cv[:, 1]),
+            "r2":                r2_score(true_cv_vals, final_cv_preds),
+            "rmse":              np.sqrt(mean_squared_error(true_cv_vals, final_cv_preds)),
+        }
+
+    # ── Full-training final models ───────────────────────────────────────────
+    gate_full = XGBClassifier(**gate_kwargs).fit(X_tr_np, rid_np, sample_weight=w_np)
+    gp_test   = gate_full.predict_proba(X_te_np)
+    gp_pred_te = np.argmax(gp_test, axis=1)
+    gate_true_te = (y_te_np >= temp_bound).astype(int)
+
+    low_m, high_m = y_tr_np < temp_bound, y_tr_np >= temp_bound
+    p_low  = XGBRegressor(**expert_kwargs).fit(X_tr_np[low_m],  y_tr_np[low_m]).predict(X_te_np)
+    p_high = XGBRegressor(**expert_kwargs).fit(X_tr_np[high_m], y_tr_np[high_m]).predict(X_te_np)
+    final_test_pred = gp_test[:, 0] * p_low + gp_test[:, 1] * p_high
+
+    test_metrics = {
+        "accuracy":          accuracy_score(gate_true_te, gp_pred_te),
+        "balanced_accuracy": balanced_accuracy_score(gate_true_te, gp_pred_te),
+        "precision":         precision_score(gate_true_te, gp_pred_te),
+        "recall":            recall_score(gate_true_te, gp_pred_te),
+        "f1":                f1_score(gate_true_te, gp_pred_te),
+        "mcc":               matthews_corrcoef(gate_true_te, gp_pred_te),
+        "ece":               expected_calibration_error(gate_true_te, gp_test[:, 1]),
+        "r2":                r2_score(y_te_np, final_test_pred),
+        "rmse":              np.sqrt(mean_squared_error(y_te_np, final_test_pred)),
+    }
+
+    return {
+        "cv_predictions":  final_cv_preds,
+        "cv_true":         true_cv_vals,
+        "cv_gate_probs":   gate_probs_cv,
+        "test_predictions": final_test_pred,
+        "gating_model":    gate_full,
+        "gate_probs_test": gp_test,
+        "cv_metrics":      cv_metrics,
+        "test_metrics":    test_metrics,
+    }
+
+
+def find_accuracies_on_restricted_feat_space_contin(
+    all_splits_dict, all_markov_bound_dict_with_res, X_column_names, feature_condit, device
+):
+    """Mixture-of-experts variant of the restricted-feature-space evaluation."""
+    test_splits = defaultdict(list)
+    print("Processing splits...")
+
+    for split_id in all_markov_bound_dict_with_res.keys():
+        sid = str(split_id)
+        split  = all_splits_dict[int(sid)]
+        X_train, y_train = split["X_train"], split["y_train"]
+        X_test,  y_test  = split["X_test"],  split["y_test"]
+        groups = split["taxa_group_names_train"]
+        mbs    = all_markov_bound_dict_with_res[sid]["MB"]
+
+        y_np = y_train.cpu().numpy() if hasattr(y_train, "cpu") else np.asarray(y_train)
+        range_labels = label_ogt_range(y_np)
+        range_ids    = np.vectorize({"low": 0, "high": 1}.get)(range_labels)
+        classes      = np.unique(range_ids)
+        weights      = compute_class_weight("balanced", classes=classes, y=range_ids)
+        sample_weights = np.array([dict(zip(classes, weights))[c] for c in range_ids])
+
+        in_mb  = [i for i, v in enumerate(X_column_names) if v in mbs]
+        out_mb = [i for i, v in enumerate(X_column_names) if v not in mbs]
+
+        def _zeroed(mask):
+            X_mod = X_test.clone() if hasattr(X_test, "clone") else X_test.copy()
+            X_mod[:, mask] = 0
+            return X_mod
+
+        def _run(Xtr, Xte):
+            return xgboost_mixture_of_experts_2_class_cv_full(
+                Xtr, y_train, range_ids, sample_weights, Xte, y_test,
+                taxonomy_labels=groups,
+            )
+
+        if feature_condit == "mb_train_test":
+            res = _run(X_train[:, in_mb], X_test[:, in_mb])
+        elif feature_condit == "mb_zero_test":
+            res = _run(X_train, _zeroed(in_mb))
+        elif feature_condit == "full":
+            res = _run(X_train, X_test)
+        elif feature_condit == "no_mb_train_test":
+            res = _run(X_train[:, out_mb], X_test[:, out_mb])
+        elif feature_condit == "no_mb_test":
+            res = _run(X_train, _zeroed(out_mb))
+        else:
+            raise ValueError(f"Unknown feature_condit: {feature_condit!r}")
+
+        for m, v in res["test_metrics"].items():
+            test_splits[m].append(v)
+
+    test_mn  = {m: np.mean(test_splits[m]) for m in test_splits}
+    test_std = {m: np.std(test_splits[m])  for m in test_splits}
+    print("Done!")
+    return defaultdict(float), defaultdict(float), test_mn, test_std
+
+
+# COG annotation helper
+
+def make_cog_descr(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Annotate a dataframe of top COG IDs with NCBI descriptions.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must have columns 'MI', 'RandomForest', 'SHAP' containing COG IDs.
+
+    Returns
+    -------
+    pd.DataFrame
+        Same columns with descriptions appended (``COG_ID: Description``).
+    """
+    url = "https://ftp.ncbi.nlm.nih.gov/pub/COG/COG2024/data/cog-24.def.tab"
+    lines = requests.get(url).content.decode("utf-8").splitlines()
+    descr_df = pd.DataFrame(
+        [l.split("\t") for l in lines if len(l.split("\t")) == 7],
+        columns=["COG_ID", "Category", "Description", "Gene", "Function", "Gene_IDs", "PDB_ID"],
+    )
+
+    out = df.copy()
+    for col in ("MI", "RandomForest", "SHAP"):
+        merged = pd.merge(out[[col]], descr_df[["COG_ID", "Description"]],
+                          left_on=col, right_on="COG_ID", how="left")
+        out[col] = out[col] + ": " + merged["Description"].fillna("")
+
+    return out[["MI", "RandomForest", "SHAP"]]

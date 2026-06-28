@@ -1,596 +1,710 @@
-import torch
-import numpy as np
-from tqdm import tqdm
+"""
+Noise injection, model evaluation under noise, and plotting utilities.
+"""
+
+#  Standard library 
+import contextlib
+import os
+import sys
+import warnings
+
+#  Third-party 
+import joblib
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import torch
 from collections import defaultdict
-from sklearn.pipeline import make_pipeline
-from xgboost import XGBClassifier
+from joblib import Parallel, delayed
 from sklearn.metrics import (
-    matthews_corrcoef,
     accuracy_score,
     balanced_accuracy_score,
-    precision_score,
-    recall_score,
+    brier_score_loss,
     f1_score,
+    matthews_corrcoef,
+    mean_squared_error,
+    precision_score,
+    r2_score,
+    recall_score,
 )
-
-from joblib import Parallel, delayed
-from tqdm import tqdm
-import numpy as np
-from sklearn.metrics import (
-    matthews_corrcoef, accuracy_score, balanced_accuracy_score,
-    precision_score, recall_score, f1_score
-)
-
-from tqdm import TqdmExperimentalWarning
-import warnings
-warnings.filterwarnings("ignore")
-warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
-
-
-from sklearn.metrics import mean_squared_error,r2_score
-
-
 from sklearn.preprocessing import LabelEncoder
-from xgboost import XGBClassifier, XGBRegressor
+from tqdm import tqdm
 
-import joblib
-
-from collections import defaultdict
-
-def sample_exp(mean):
-    sample = np.random.exponential(scale=mean)  # scale = 1/λ
-    return sample
-
-def sample_unif(mean):
-    sample = np.random.uniform(0, 2*mean)
-    return sample   
-
-def sample_gamma(mean, scale = 0.5):#(shape, scale):
-    shape = mean/scale
-    sample = np.random.gamma(shape, scale)
-    return sample   
+warnings.filterwarnings("ignore", category=FutureWarning, module="xgboost")
 
 
-def fp_curve_areas_one_model(metric, max_fp, max_fn, cog_remov_add_accuracies):
-    fn_space = []
-    fp_curves = defaultdict(list)
-    for (fn, fp) in cog_remov_add_accuracies.keys():   
-        if fp <= max_fp:
-            if fn <= max_fn:
-                fp_curves[fp].append(cog_remov_add_accuracies[(fn, fp)][metric][0])
-                if fn not in fn_space:
-                    fn_space.append(fn)
-    fp_curve_areas = []
-    for fp in fp_curves.keys():
-        fp_curve_areas.append(np.trapezoid(fp_curves[fp], fn_space))
-    return  fp_curve_areas       
+# Calibration
+
+def expected_calibration_error(y_true, y_prob, n_bins: int = 10) -> float:
+    """
+    Expected Calibration Error (ECE) for binary predictions.
+
+    Bins predicted probabilities into equally spaced intervals and computes
+    the weighted mean absolute difference between mean predicted probability
+    and empirical accuracy within each bin.
+
+    Parameters
+    ----------
+    y_true : array-like
+        Ground-truth binary labels (0 or 1).
+    y_prob : array-like
+        Predicted probabilities for the positive class.
+    n_bins : int
+        Number of equally spaced bins.
+
+    Returns
+    -------
+    float
+        ECE in [0, 1]; 0 = perfectly calibrated.
+    """
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    bin_edges = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        mask = (y_prob >= bin_edges[i]) & (y_prob < bin_edges[i + 1])
+        if mask.any():
+            ece += np.abs(y_true[mask].mean() - y_prob[mask].mean()) * mask.mean()
+    return ece
 
 
-def augment_data_with_noise(X_val_train, y_label_train, n_clones, mean_fp, mean_fn, noise_type=None, filename=None):
-    # Start with the original data as lists
-    X_augmented_list = [X_val_train]
-    y_augmented_list = [y_label_train]
+# Noise injection
 
-    if n_clones == 0:
-        return X_val_train.clone(), y_label_train.clone()
+def _sample_noise_rate(mean: float, noise_type: str) -> float:
+    """Draw a single noise-rate sample from the specified distribution."""
+    if noise_type == "exp":
+        return np.random.exponential(scale=mean)
+    if noise_type == "gamma":
+        scale = 0.5
+        return np.random.gamma(mean / scale, scale)
+    if noise_type == "unif":
+        return np.random.uniform(0, 2 * mean)
+    raise ValueError(f"Unknown noise_type: {noise_type!r}. Choose 'exp', 'gamma', or 'unif'.")
 
-    n_rows, _ = X_val_train.shape
-    for i in range(n_rows):   
-        genome = X_val_train[i]
-        label = y_label_train[i]
-        for _ in range(n_clones):
 
-            # Sample FP/FN rates based on noise_type
-            if noise_type == "exp":
-                fp_rate_sampled = sample_exp(mean_fp)
-                fn_rate_sampled = sample_exp(mean_fn)
-            elif noise_type == "gamma":  
-                fp_rate_sampled = sample_gamma(mean_fp)
-                fn_rate_sampled = sample_gamma(mean_fn)
-            elif noise_type == "unif":     
-                fp_rate_sampled = sample_unif(mean_fp)
-                fn_rate_sampled = sample_unif(mean_fn) 
-            else:
-                print(f"Incorrect noise type!")
+def apply_noise(genome: torch.Tensor, fp_rate: float, fn_rate: float) -> torch.Tensor:
+    """
+    Apply Poisson-distributed false-positive and false-negative noise to a
+    single genome (count) vector.
 
-            # Apply noise
-            genome_noisy = apply_noise(genome, fp_rate=fp_rate_sampled, fn_rate=fn_rate_sampled)
-            
-            # Append to lists
-            X_augmented_list.append(genome_noisy.unsqueeze(0))
-            y_augmented_list.append(label.unsqueeze(0))
-
-    # Stack / concatenate once at the end
-    X_augmented = torch.cat(X_augmented_list, dim=0)
-    y_augmented = torch.cat(y_augmented_list, dim=0)
-
-    # Shuffle the augmented dataset
-    idx = torch.randperm(len(X_augmented))
-    X_augmented, y_augmented = X_augmented[idx], y_augmented[idx]
-
-    return X_augmented, y_augmented
-
-def apply_noise(genome, fp_rate, fn_rate):
+    False negatives subtract Poisson(count * fn_rate) from each entry.
+    False positives add Poisson(fp_rate) to every entry (including zeros).
+    Result is clamped to ≥ 0.
+    """
     genome_noisy = genome.float().clone()
-
-    # False negatives (multiple hits per count, Poisson distributed)
     losses = torch.poisson(genome.float() * fn_rate)
     genome_noisy = torch.clamp(genome_noisy - losses.int(), min=0)
 
-    # False positives (Poisson noise added to zeros only)
-    fp_add = torch.zeros_like(genome).float()
-    zero_mask = genome > -1
-    fp_add[zero_mask] = torch.poisson(torch.full((zero_mask.sum(),), fp_rate))
+    fp_add = torch.poisson(torch.full_like(genome, fp_rate, dtype=torch.float))
     genome_noisy = genome_noisy + fp_add
-
     return genome_noisy
 
-def flip_with_fractional_noise(X: torch.Tensor, fp_rate: float, fn_rate: float,
-                               noise_std = 0.3, hard_fn_flag = False):
+
+def flip_with_fractional_noise(
+    X: torch.Tensor,
+    fp_rate: float,
+    fn_rate: float,
+    noise_std: float = 0.3,
+    hard_fn_flag: bool = False,
+) -> torch.Tensor:
+    """
+    Apply fractional false-positive / false-negative noise to a feature matrix.
+
+    For each row:
+    - False negatives: a fraction `fn_rate` of positive entries are set to 0
+      (hard_fn_flag=True) or decremented by 1 (hard_fn_flag=False).
+    - False positives: a fraction `fp_rate` of all entries are incremented by 1.
+
+    Result is clamped to ≥ 0.
+
+    Parameters
+    ----------
+    X : torch.Tensor, shape (n_samples, n_features)
+    fp_rate : float
+    fn_rate : float
+    noise_std : float
+        Std of optional Gaussian perturbation (currently unused in hard mode).
+    hard_fn_flag : bool
+        If True, set affected entries to 0; otherwise decrement by 1.
+
+    Returns
+    -------
+    torch.Tensor
+        Noisy copy of X.
+    """
     X_noisy = X.float().clone()
-    n_rows, _ = X_noisy.shape
-    for i in range(n_rows):
-        # False negatives: subtract (1 + noise) from fraction of positives
+    for i in range(X_noisy.shape[0]):
         pos_idx = torch.nonzero(X[i] > 0).flatten()
         n_fn = int(round(fn_rate * len(pos_idx)))
-
         if n_fn > 0:
             fn_idx = pos_idx[torch.randperm(len(pos_idx))[:n_fn]]
-            noise = torch.randn(len(fn_idx)) * noise_std
-            if hard_fn_flag == False:
-                X_noisy[i, fn_idx] -= 1#(1.0 + noise)
+            if hard_fn_flag:
+                X_noisy[i, fn_idx] = 0
             else:
-                X_noisy[i, fn_idx] = 0 
+                X_noisy[i, fn_idx] -= 1
 
-        # False positives: add (1 + noise) to fraction of zeros
-        zero_idx = torch.nonzero(X[i] > -1).flatten()
-        n_fp = int(round(fp_rate * len(zero_idx)))
+        all_idx = torch.nonzero(X[i] > -1).flatten()
+        n_fp = int(round(fp_rate * len(all_idx)))
         if n_fp > 0:
-            fp_idx = zero_idx[torch.randperm(len(zero_idx))[:n_fp]]
-            noise = torch.randn(len(fp_idx)) * noise_std
-            X_noisy[i, fp_idx] += 1 #(1.0 + noise)
+            fp_idx = all_idx[torch.randperm(len(all_idx))[:n_fp]]
+            X_noisy[i, fp_idx] += 1
 
-    # Clamp to ensure no negatives
-    X_noisy = torch.clamp(X_noisy, min=0.0)    
-
-    return X_noisy
+    return torch.clamp(X_noisy, min=0.0)
 
 
-#     return cog_remov_add_accuracies
+def augment_data_with_noise(
+    X: torch.Tensor,
+    y: torch.Tensor,
+    n_clones: int,
+    mean_fp: float,
+    mean_fn: float,
+    noise_type: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Augment a dataset by adding `n_clones` noisy copies of each sample.
 
-import warnings
-warnings.filterwarnings("ignore", category=FutureWarning, module="xgboost")
+    Noise rates are drawn independently per clone from the specified
+    distribution (``noise_type`` ∈ {'exp', 'gamma', 'unif'}).
 
-import xgboost
-import os, sys
-import contextlib
+    Parameters
+    ----------
+    X : torch.Tensor, shape (n_samples, n_features)
+    y : torch.Tensor, shape (n_samples,) or (n_samples, 1)
+    n_clones : int
+        Number of noisy copies to generate per original sample.
+    mean_fp, mean_fn : float
+        Mean false-positive / false-negative rates passed to the sampler.
+    noise_type : str
+        Distribution from which to sample noise rates.
+
+    Returns
+    -------
+    X_augmented, y_augmented : torch.Tensor
+        Shuffled augmented dataset (original samples included).
+    """
+    if n_clones == 0:
+        return X.clone(), y.clone()
+
+    X_parts = [X]
+    y_parts = [y]
+
+    for i in range(X.shape[0]):
+        genome = X[i]
+        label  = y[i]
+        for _ in range(n_clones):
+            fp = _sample_noise_rate(mean_fp, noise_type)
+            fn = _sample_noise_rate(mean_fn, noise_type)
+            X_parts.append(apply_noise(genome, fp, fn).unsqueeze(0))
+            y_parts.append(label.unsqueeze(0))
+
+    X_aug = torch.cat(X_parts, dim=0)
+    y_aug = torch.cat(y_parts, dim=0)
+
+    perm = torch.randperm(len(X_aug))
+    return X_aug[perm], y_aug[perm]
+
+def process_res(res):
+    return res.iloc[0] if not res.empty else ''
+
+# Utility helpers
+
+def label_ogt_range(y, high_thresh: float = 45.0) -> np.ndarray:
+    """Label samples as 'low' or 'high' based on an OGT threshold."""
+    return np.where(np.asarray(y).flatten() < high_thresh, "low", "high")
+
+
+def _to_numpy(arr) -> np.ndarray:
+    if hasattr(arr, "cpu"):
+        return arr.cpu().numpy().flatten()
+    return np.asarray(arr).flatten()
+
+
+def _agg(arr: list) -> tuple[float, float]:
+    """Return (mean, std) of a list."""
+    return float(np.mean(arr)), float(np.std(arr))
+
 
 @contextlib.contextmanager
-def suppress_xgb_warnings():
+def _suppress_stderr():
+    """Redirect stderr to /dev/null (suppresses XGBoost C++ warnings)."""
     with open(os.devnull, "w") as fnull:
-        old_stderr = sys.stderr
+        old = sys.stderr
         sys.stderr = fnull
         try:
             yield
         finally:
-            sys.stderr = old_stderr
+            sys.stderr = old
 
+
+# Noise-rate grid definitions
+
+_FP_GRID = [0.0, 0.05, 0.1, 0.15, 0.2]
+_FN_GRID = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+_FP_MEAN_GRID = [0.0, 0.05, 0.1, 0.15, 0.2, 0.5]
+_FN_MEAN_GRID = [0.0, 0.2, 0.5, 1.0, 2.0, 4.0]
+
+
+def _filter_grid(grid: list, lo: float, hi: float) -> list:
+    return [v for v in grid if lo <= v <= hi]
+
+
+# Model evaluation under noise
 
 def eval_trained_models_on_noisy_data(
-    all_splits_dict,
-    trained_models,
-    hard_fn_flag=False,
-    max_fp=0.2,
-    max_fn=1.0,
-    n_jobs=-1,
-    truncated_feature_set = None,
-    test_or_val = "test"
-):
-    cog_adding_rates = [fp for fp in [0.0, 0.05, 0.1, 0.15, 0.2] if fp <= max_fp]
-    cog_removal_rates = [fn for fn in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0] if fn <= max_fn]
+    all_splits_dict: dict,
+    trained_models: dict,
+    hard_fn_flag: bool = False,
+    min_fp: float = 0.0,
+    min_fn: float = 0.0,
+    max_fp: float = 0.2,
+    max_fn: float = 1.0,
+    n_jobs: int = -1,
+    truncated_feature_set=None,
+    test_or_val: str = "test",
+) -> dict:
+    """
+    Evaluate trained classifiers on a grid of (FN rate, FP rate) noise levels.
 
-    # Cache test splits on CPU once
-    if test_or_val == "test":
-        test_data = {
-            sid: (v["X_test"].cpu(), v["y_test"].cpu())
-            for sid, v in all_splits_dict.items()
-        }
-    else:
-        test_data = {
-            sid: (v["X_val"].cpu(), v["y_val"].cpu())
-            for sid, v in all_splits_dict.items()
-        }        
+    Parameters
+    ----------
+    all_splits_dict : dict
+        Per-split data; each value must have 'X_test'/'X_val' and 'y_test'/'y_val'.
+    trained_models : dict
+        {split_id: fitted pipeline} mapping.
+    hard_fn_flag : bool
+        If True, false-negative entries are zeroed; otherwise decremented by 1.
+    min_fp, min_fn : float
+        Lower bounds of the noise grid (inclusive).
+    max_fp, max_fn : float
+        Upper bounds of the noise grid (inclusive).
+    n_jobs : int
+        Parallel workers passed to joblib.
+    truncated_feature_set : array-like or None
+        Optional feature-index subset applied before noise injection.
+    test_or_val : str
+        Which split partition to evaluate on ('test' or 'val').
 
-    cog_remov_add_accuracies = {}
+    Returns
+    -------
+    dict
+        ``{(fn_rate, fp_rate): {metric: (mean, std), ...}}``
+        Metrics: mcc, accuracy, balanced_accuracy, precision, recall, f1, brier, ece.
+    """
+    fp_rates = _filter_grid(_FP_GRID, min_fp, max_fp)
+    fn_rates = _filter_grid(_FN_GRID, min_fn, max_fn)
+    x_key = "X_test" if test_or_val == "test" else "X_val"
+    y_key = "y_test" if test_or_val == "test" else "y_val"
 
-    # --- define evaluation function for parallel use ---
-    def eval_one_noise(rem_rate, add_rate):
-        mcc_arr, acc_arr, bacc_arr, prec_arr, rec_arr, f1_arr = [], [], [], [], [], []
+    test_data = {
+        sid: (v[x_key].cpu(), v[y_key].cpu())
+        for sid, v in all_splits_dict.items()
+    }
+    if truncated_feature_set is not None:
+        test_data = {sid: (X[:, truncated_feature_set], y) for sid, (X, y) in test_data.items()}
 
-        import warnings
+    def _eval_one(rem_rate, add_rate):
+        metrics = defaultdict(list)
         with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=".*glibc.*", category=FutureWarning)
-
+            warnings.filterwarnings("ignore")
             for split_id, pipe in trained_models.items():
-                X_val_test, y_label_test = test_data[int(split_id)]
+                X, y = test_data[int(split_id)]
+                X_noisy = flip_with_fractional_noise(X, add_rate, rem_rate, hard_fn_flag=hard_fn_flag)
+                with _suppress_stderr():
+                    y_pred = pipe.predict(X_noisy)
+                y_prob = pipe.predict_proba(X_noisy)[:, 1]
 
-                if truncated_feature_set is not None:
-                    X_val_test = X_val_test[:, truncated_feature_set]
-    
-                # Apply noise once per model-split
-                X_val_test_noisy = flip_with_fractional_noise(
-                    X_val_test, add_rate, rem_rate, noise_std=0.3, hard_fn_flag=hard_fn_flag
-                )
-                with suppress_xgb_warnings():
-                    y_pred = pipe.predict(X_val_test_noisy)
-    
-                mcc_arr.append(matthews_corrcoef(y_label_test, y_pred))
-                acc_arr.append(accuracy_score(y_label_test, y_pred))
-                bacc_arr.append(balanced_accuracy_score(y_label_test, y_pred))
-                prec_arr.append(precision_score(y_label_test, y_pred, zero_division=0))
-                rec_arr.append(recall_score(y_label_test, y_pred, zero_division=0))
-                f1_arr.append(f1_score(y_label_test, y_pred, zero_division=0))
-    
-            # Aggregate metrics
-            return (rem_rate, add_rate, {
-                "mcc": (np.mean(mcc_arr), np.std(mcc_arr)),
-                "accuracy": (np.mean(acc_arr), np.std(acc_arr)),
-                "balanced_accuracy": (np.mean(bacc_arr), np.std(bacc_arr)),
-                "precision": (np.mean(prec_arr), np.std(prec_arr)),
-                "recall": (np.mean(rec_arr), np.std(rec_arr)),
-                "f1": (np.mean(f1_arr), np.std(f1_arr)),
-            })
-    
-    with suppress_xgb_warnings():
-        warnings.filterwarnings("ignore", message=".*glibc.*", category=FutureWarning)
+                metrics["mcc"].append(matthews_corrcoef(y, y_pred))
+                metrics["accuracy"].append(accuracy_score(y, y_pred))
+                metrics["balanced_accuracy"].append(balanced_accuracy_score(y, y_pred))
+                metrics["precision"].append(precision_score(y, y_pred, zero_division=0))
+                metrics["recall"].append(recall_score(y, y_pred, zero_division=0))
+                metrics["f1"].append(f1_score(y, y_pred, zero_division=0))
+                metrics["brier"].append(brier_score_loss(y, y_prob))
+                metrics["ece"].append(expected_calibration_error(y, y_prob))
+
+        return rem_rate, add_rate, {k: _agg(v) for k, v in metrics.items()}
+
+    with _suppress_stderr():
         results = Parallel(n_jobs=n_jobs)(
-            delayed(eval_one_noise)(rem_rate, add_rate)
-            for rem_rate in cog_removal_rates# tqdm(cog_removal_rates, desc="removal rates")
-            for add_rate in cog_adding_rates
+            delayed(_eval_one)(rem, add)
+            for rem in fn_rates
+            for add in fp_rates
         )
 
-    # Convert to dictionary
-    cog_remov_add_accuracies = {(r, a): metrics for (r, a, metrics) in results}
+    return {(rem, add): m for rem, add, m in results}
 
-    return cog_remov_add_accuracies
-
-
-import os
-
-def read_and_evaluate_models_for_x_and_sigma(trained_models_dir, x_noisy_samples, noise_type, metric, all_splits_dict, output_dir, clean_test_flag = True, add_rate = None, rem_rate = None, noise_std = 0.3, hard_fn_flag = None):
-    mn_fn_arr = [0.0, 0.2, 0.5, 1.0, 2.0, 4.0]
-    mn_fp_arr = [0.0, 0.05, 0.1, 0.15, 0.2, 0.5]
-    # mn_fp_arr = [0.0, 0.05, 0.1, 0.15, 0.2]
-    # mn_fn_arr = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]
-
-    mean_rem_add_rates_tuples = [(add, rem) for add in mn_fp_arr for rem in mn_fn_arr]
-    
-    
-    noise_increase_accuracy = {}
-    for i in tqdm(range(len(mean_rem_add_rates_tuples)), desc="Processing noise rates..."):    
-        (fp_rate_mean, fn_rate_mean) = mean_rem_add_rates_tuples[i]
-        noise_rates = (fp_rate_mean, fn_rate_mean)
-
-        filename = f"trained_models_fp_{fp_rate_mean}_fn_{fn_rate_mean}_noise_type_{noise_type}_x_{x_noisy_samples}.pkl"
-    
-       # filename = f"trained_models_fp_{fp_rate_mean}_fn_{fn_rate_mean}_sigma_fp_{sigma_fp}_sigma_fn_{sigma_fn}_x_{x_noisy_samples}.pkl"
-        filepath = f"{output_dir}/{trained_models_dir}/{filename}"
-        metrics_accum = {key: [] for key in ["mcc", "accuracy", "balanced_accuracy", "precision", "recall", "f1"]}
-        if os.path.exists(filepath):
-            loaded_models_dict = joblib.load(filepath)
-            
-            for split_id in loaded_models_dict.keys():#range(3):#all_splits_dict.keys(): #all_splits_dict.keys()
-                trained_model = loaded_models_dict[split_id]
-                X_val_test = all_splits_dict[split_id]["X_val"]
-                y_label_test = all_splits_dict[split_id]["y_val"]
-               
-                if clean_test_flag == True:
-                    y_pred = trained_model.predict(X_val_test)
-
-                else:  
-                    # Apply noise
-                    X_val_test_noisy = flip_with_fractional_noise(
-                        X_val_test.cpu(), add_rate, rem_rate, noise_std , hard_fn_flag = hard_fn_flag)
-                    y_pred = trained_model.predict(X_val_test_noisy)
-
-                    # Apply noise
-                    # X_val_test_noisy = torch.empty((0, X_val_test.shape[1]), dtype=X_val_test.dtype)
-                    # n_rows, _ = X_val_test.shape
-                    # for i in range(n_rows):
-                    #     noisy_genome = apply_noise(X_val_test[i], fp_rate=add_rate, fn_rate=rem_rate)
-                    #     noisy_genome = noisy_genome.unsqueeze(0)
-                    #     X_val_test_noisy = torch.cat([X_val_test_noisy, noisy_genome.clone()], dim=0)
-                    
-                    y_pred = trained_model.predict(X_val_test_noisy)
-
-                metrics_accum["mcc"].append(matthews_corrcoef(y_label_test.cpu(), y_pred))
-                metrics_accum["accuracy"].append(accuracy_score(y_label_test.cpu(), y_pred))
-                metrics_accum["balanced_accuracy"].append(balanced_accuracy_score(y_label_test.cpu(), y_pred))
-                metrics_accum["precision"].append(precision_score(y_label_test.cpu(), y_pred, zero_division=0))
-                metrics_accum["recall"].append(recall_score(y_label_test.cpu(), y_pred, zero_division=0))
-                metrics_accum["f1"].append(f1_score(y_label_test.cpu(), y_pred, zero_division=0))
-            
-            test_accuracy_scores = {k: [np.mean(v), np.std(v)] for k,v in metrics_accum.items()}    
-        else:
-            test_accuracy_scores = {k: [None, None] for k,v in metrics_accum.items()}
-        noise_increase_accuracy[tuple(noise_rates)] = test_accuracy_scores
-    
-    noise_increase_accuracy_one_metric = {}
-    for key in noise_increase_accuracy.keys():
-        noise_increase_accuracy_one_metric[key] = noise_increase_accuracy[key] [metric]
-        
-  #  areas_mn_std=areas_across_fps(noise_increase_accuracy_one_metric)     
-    
-        
-    return noise_increase_accuracy_one_metric#, areas_mn_std
-
-
-import os
-import joblib
-
-def read_and_evaluate_models_for_x_and_sigma_regress(trained_models_dir, x_noisy_samples, noise_type, metric, all_splits_dict, output_directory, clean_test_flag = True, add_rate = None, rem_rate = None, noise_std = 0.3, hard_fn_flag = None):
-    mn_fn_arr = [0.0, 0.2, 0.5, 1.0, 2.0, 4.0]
-    mn_fp_arr = [0.0, 0.05, 0.1, 0.15, 0.2, 0.5]
-    # mn_fp_arr = [0.0, 0.05, 0.1, 0.15, 0.2]
-    # mn_fn_arr = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]
-
-    mean_rem_add_rates_tuples = [(add, rem) for add in mn_fp_arr for rem in mn_fn_arr]
-    mean_rem_add_rates_tuples
-    
-    noise_increase_accuracy = {}
-    for i in tqdm(range(len(mean_rem_add_rates_tuples)), desc="Processing noise rates..."):    
-        (fp_rate_mean, fn_rate_mean) = mean_rem_add_rates_tuples[i]
-        noise_rates = (fp_rate_mean, fn_rate_mean)
-
-        filename = f"trained_models_fp_{fp_rate_mean}_fn_{fn_rate_mean}_noise_type_{noise_type}_x_{x_noisy_samples}.pkl"
-    
-       # filename = f"trained_models_fp_{fp_rate_mean}_fn_{fn_rate_mean}_sigma_fp_{sigma_fp}_sigma_fn_{sigma_fn}_x_{x_noisy_samples}.pkl"
-        filepath = f"{output_directory}/{trained_models_dir}/{filename}"
-        metrics_accum = {key: [] for key in ["mcc", "accuracy", "balanced_accuracy", "precision", "recall", "f1", "rmse", "r2"]}
-        if os.path.exists(filepath):
-            loaded_models_dict = joblib.load(filepath)
-            
-            
-            for split_id in loaded_models_dict.keys():#range(3):#all_splits_dict.keys(): #all_splits_dict.keys()
-                trained_model = loaded_models_dict[split_id]
-                classifier, regressor_low, regressor_high = trained_model
-                
-                X_val_test = all_splits_dict[split_id]["X_test"]
-                y_label_test = all_splits_dict[split_id]["y_test"]
-
-                # Convert to numpy
-                y_train_np = y_label_test.cpu().numpy().flatten()
-                range_labels = label_ogt_range(y_label_test)
-                le = LabelEncoder()
-                range_ids = le.fit_transform(range_labels)  # Converts to 0,1,2
-                label_to_int = {'low': 0, 'high': 1}
-                range_ids = np.vectorize(label_to_int.get)(range_labels)
-                
-                if clean_test_flag == True:
-                    classifier_pred = classifier.predict(X_val_test)
-                    classifier_probs = classifier.predict_proba(X_val_test)
-
-                    # Final prediction
-                    pred_low  = regressor_low.predict(X_val_test)
-                    pred_high  = regressor_high.predict(X_val_test)
-                    final_pred = (classifier_probs[:, 0]  * pred_low +classifier_probs[:, 1] * pred_high)
-                    
-                else:  
-                    # Apply noise
-                    X_val_test_noisy = flip_with_fractional_noise(
-                        X_val_test.cpu(), add_rate, rem_rate, noise_std , hard_fn_flag = hard_fn_flag)
-                    classifier_pred = classifier.predict(X_val_test_noisy)
-                    classifier_probs = classifier.predict_proba(X_val_test_noisy)
-
-                    # Final prediction
-                    pred_low  = regressor_low.predict(X_val_test_noisy)
-                    pred_high  = regressor_high.predict(X_val_test_noisy)
-                    final_pred = (classifier_probs[:, 0]  * pred_low +classifier_probs[:, 1] * pred_high)
-
-                metrics_accum["mcc"].append(matthews_corrcoef(range_ids, classifier_pred))
-                metrics_accum["accuracy"].append(accuracy_score(range_ids, classifier_pred))
-                metrics_accum["balanced_accuracy"].append(balanced_accuracy_score(range_ids, classifier_pred))
-                metrics_accum["precision"].append(precision_score(range_ids, classifier_pred, zero_division=0))
-                metrics_accum["recall"].append(recall_score(range_ids, classifier_pred, zero_division=0))
-                metrics_accum["f1"].append(f1_score(range_ids, classifier_pred, zero_division=0))
-                metrics_accum["rmse"].append(np.sqrt(mean_squared_error(y_label_test.cpu(), final_pred))),
-                metrics_accum["r2"].append(r2_score(y_label_test.cpu(), final_pred))
-            
-            test_accuracy_scores = {k: [np.mean(v), np.std(v)] for k,v in metrics_accum.items()}    
-        else:
-            test_accuracy_scores = {k: [None, None] for k,v in metrics_accum.items()}
-        noise_increase_accuracy[tuple(noise_rates)] = test_accuracy_scores
-    
-    noise_increase_accuracy_one_metric = {}
-    for key in noise_increase_accuracy.keys():
-        noise_increase_accuracy_one_metric[key] = noise_increase_accuracy[key] [metric]
-        
-  #  areas_mn_std=areas_across_fps(noise_increase_accuracy_one_metric)     
-    
-        
-    return noise_increase_accuracy_one_metric#, areas_mn_std
-
-
-def label_ogt_range(y,high_thresh=45):
-    labels = []
-    for val in y:
-        if val < high_thresh:
-            labels.append('low')
-        else:
-            labels.append('high')
-    return np.array(labels)
-
-def process_res(res):
-    if not res.empty:
-        res_predict_comm = res.iloc[0]
-    else:
-        res_predict_comm = ''
-    return res_predict_comm  
-
-# def eval_trained_models_on_noisy_data_classif_and_regress(trained_models, all_splits_dict, hard_fn_flag = False, max_fp = 0.2, max_fn = 1):
-#    # cog_removal_rates = [0.0, 0.2, 0.5, 1.0, 2.0, 4.0]
-#    # cog_adding_rates = [0.0, 0.05, 0.1, 0.15, 0.2]
-#     cog_adding_rates =  [0.0, 0.05, 0.1, 0.15, 0.2]
-#     cog_removal_rates = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]
-
-#     cog_adding_rates = [fp_i for fp_i in cog_adding_rates if fp_i <= max_fp]
-#     cog_removal_rates = [fn_i for fn_i in cog_removal_rates if fn_i <= max_fn]
-    
-#     cog_remov_add_accuracies = {}
-#     noise_std =0.3
-    
-#     for rem_rate in tqdm(cog_removal_rates, desc="removal rates"):
-#         for add_rate in cog_adding_rates:#tqdm(cog_adding_rates, desc=f"adding rates (rem={rem_rate:.2f})", leave=False):
-            
-#             mcc_arr, mcc_accuracy, mcc_balanced_accuracy = [], [], []
-#             mcc_precision, mcc_recall, mcc_f1 = [], [], []
-#             rmse_arr, r2_arr = [], []
-            
-#             for split_id, models in trained_models.items():
-#                 classifier, regressor_low, regressor_high = models
-#                 X_val_test  = all_splits_dict[split_id]["X_test"]
-#                 y_label_test = all_splits_dict[split_id]["y_test"]
-
-#                 range_labels = label_ogt_range(y_label_test)
-#                 le = LabelEncoder()
-#                 range_ids = le.fit_transform(range_labels)  # Converts to 0,1,2
-#                 label_to_int = {'low': 0, 'high': 1}
-#                 range_ids = np.vectorize(label_to_int.get)(range_labels)
-    
-#                 # Apply noise
-#                 hard_fn_flag = True
-                
-#                 X_val_test_noisy = flip_with_fractional_noise(
-#                     X_val_test.cpu(), add_rate, rem_rate, noise_std , hard_fn_flag = hard_fn_flag)
-
-#                 #TODO: add weights
-
-#                 # Predictions & metrics
-#                 classifier_pred = classifier.predict(X_val_test_noisy)
-#                 classifier_probs = classifier.predict_proba(X_val_test_noisy)
-                
-#                 mcc_arr.append(matthews_corrcoef(range_ids, classifier_pred))
-#                 mcc_accuracy.append(accuracy_score(range_ids, classifier_pred))
-#                 mcc_balanced_accuracy.append(balanced_accuracy_score(range_ids, classifier_pred))
-#                 mcc_precision.append(precision_score(range_ids, classifier_pred, zero_division=0))
-#                 mcc_recall.append(recall_score(range_ids, classifier_pred, zero_division=0))
-#                 mcc_f1.append(f1_score(range_ids, classifier_pred, zero_division=0))
-
-#                 # Final prediction
-#                 pred_low  = regressor_low.predict(X_val_test_noisy)
-#                 pred_high  = regressor_high.predict(X_val_test_noisy)
-
-#                 final_pred = (classifier_probs[:, 0]  * pred_low +classifier_probs[:, 1] * pred_high)
-
-#                 rmse_arr.append(np.sqrt(mean_squared_error(y_label_test.cpu(), final_pred)))
-#                 r2_arr.append(r2_score(y_label_test.cpu(), final_pred))
-
-
-#             # Save aggregated metrics
-#             cog_remov_add_accuracies[(rem_rate, add_rate)] = {
-#                 "mcc": (np.mean(mcc_arr), np.std(mcc_arr)),
-#                 "accuracy": (np.mean(mcc_accuracy), np.std(mcc_accuracy)),
-#                 "balanced_accuracy": (np.mean(mcc_balanced_accuracy), np.std(mcc_balanced_accuracy)),
-#                 "precision": (np.mean(mcc_precision), np.std(mcc_precision)),
-#                 "recall": (np.mean(mcc_recall), np.std(mcc_recall)),
-#                 "f1": (np.mean(mcc_f1), np.std(mcc_f1)),
-#                 "rmse": (np.mean(rmse_arr), np.std(rmse_arr)),
-#                 "r2": (np.mean(r2_arr), np.std(r2_arr))
-#             }
-#     return cog_remov_add_accuracies
-
-from tqdm import tqdm
-import numpy as np
-from sklearn.metrics import (
-    matthews_corrcoef, accuracy_score, balanced_accuracy_score,
-    precision_score, recall_score, f1_score, mean_squared_error, r2_score
-)
-from sklearn.preprocessing import LabelEncoder
-from joblib import Parallel, delayed
-from tqdm import tqdm
-import numpy as np
-from sklearn.metrics import (
-    matthews_corrcoef, accuracy_score, balanced_accuracy_score,
-    precision_score, recall_score, f1_score, mean_squared_error, r2_score
-)
 
 def eval_trained_models_on_noisy_data_classif_and_regress(
-    trained_models, all_splits_dict, hard_fn_flag=False, max_fp=0.2, max_fn=1, n_jobs=-1, truncated_feature_set=None
-):
-    cog_adding_rates = [r for r in [0.0, 0.05, 0.1, 0.15, 0.2] if r <= max_fp]
-    cog_removal_rates = [r for r in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0] if r <= max_fn]
-    noise_std = 0.3
+    trained_models: dict,
+    all_splits_dict: dict,
+    hard_fn_flag: bool = False,
+    min_fp: float = 0.0,
+    min_fn: float = 0.0,
+    max_fp: float = 0.2,
+    max_fn: float = 1.0,
+    n_jobs: int = -1,
+    truncated_feature_set=None,
+    test_or_val: str = "val",
+) -> dict:
+    """
+    Evaluate mixture-of-experts models (classifier + quantile regressors) under noise.
 
-    # --- Pre-cache data ---
+    Each entry in `trained_models` must be a 7-tuple:
+        (classifier, reg_low, reg_high,
+         reg_low_q10, reg_low_q90, reg_high_q10, reg_high_q90)
+
+    Returns
+    -------
+    dict
+        ``{(fn_rate, fp_rate): {metric: (mean, std), ...}}``
+        Metrics include classification (mcc, accuracy, balanced_accuracy,
+        precision, recall, f1, brier, ece), regression (rmse, r2), and
+        interval calibration (coverage_low/high/final, mqce_low/high/final,
+        interval_width).
+    """
+    fp_rates = _filter_grid(_FP_GRID, min_fp, max_fp)
+    fn_rates = _filter_grid(_FN_GRID, min_fn, max_fn)
+    noise_std = 0.3
+    x_key = "X_test" if test_or_val == "test" else "X_val"
+    y_key = "y_test" if test_or_val == "test" else "y_val"
+
+    # Pre-cache tensors and OGT range labels per split
     split_cache = {}
     for split_id, models in trained_models.items():
-        X_test = all_splits_dict[split_id]["X_test"]
-        y_test = all_splits_dict[split_id]["y_test"]
-
+        X = all_splits_dict[split_id][x_key]
+        y = all_splits_dict[split_id][y_key]
         if truncated_feature_set is not None:
-            X_test = X_test[:, truncated_feature_set]
+            X = X[:, truncated_feature_set]
+        range_ids = np.vectorize({"low": 0, "high": 1}.get)(label_ogt_range(y))
+        split_cache[split_id] = (X, y, range_ids, models)
 
-        range_labels = label_ogt_range(y_test)
-        label_to_int = {'low': 0, 'high': 1}
-        range_ids = np.vectorize(label_to_int.get)(range_labels)
+    def _coverage(y_true, y_lo, y_hi) -> float:
+        return float(np.mean((y_true >= y_lo) & (y_true <= y_hi)))
 
-        split_cache[split_id] = (X_test, y_test, range_ids, models)
+    def _mqce(y_true, y_q10, y_q90) -> float:
+        return float(np.mean([
+            abs(np.mean(y_true <= y_q10) - 0.1),
+            abs(np.mean(y_true <= y_q90) - 0.9),
+        ]))
 
-    # --- Define worker function ---
-    def evaluate_one_condition(rem_rate, add_rate):
-        mcc_arr, acc_arr, bal_acc_arr = [], [], []
-        prec_arr, rec_arr, f1_arr = [], [], []
-        rmse_arr, r2_arr = [], []
+    def _eval_one(rem_rate, add_rate):
+        m = defaultdict(list)
 
-        for split_id, (X_test, y_test, range_ids, models) in split_cache.items():
-            classifier, reg_low, reg_high = models
+        for _, (X, y, range_ids, models) in split_cache.items():
+            clf, reg_lo, reg_hi, reg_lo_q10, reg_lo_q90, reg_hi_q10, reg_hi_q90 = models
 
-            # Apply noise
-            X_noisy = flip_with_fractional_noise(
-                X_test, add_rate, rem_rate, noise_std, hard_fn_flag=True
-            )
+            X_noisy = flip_with_fractional_noise(X, add_rate, rem_rate, noise_std, hard_fn_flag=True)
+            y_np = _to_numpy(y)
 
-            # --- Classification ---
-            y_pred = classifier.predict(X_noisy)
-            y_proba = classifier.predict_proba(X_noisy)
+            # Classification
+            y_pred  = clf.predict(X_noisy)
+            y_proba = clf.predict_proba(X_noisy)
+            p_lo, p_hi = y_proba[:, 0], y_proba[:, 1]
 
-            mcc_arr.append(matthews_corrcoef(range_ids, y_pred))
-            acc_arr.append(accuracy_score(range_ids, y_pred))
-            bal_acc_arr.append(balanced_accuracy_score(range_ids, y_pred))
-            prec_arr.append(precision_score(range_ids, y_pred, zero_division=0))
-            rec_arr.append(recall_score(range_ids, y_pred, zero_division=0))
-            f1_arr.append(f1_score(range_ids, y_pred, zero_division=0))
+            m["mcc"].append(matthews_corrcoef(range_ids, y_pred))
+            m["accuracy"].append(accuracy_score(range_ids, y_pred))
+            m["balanced_accuracy"].append(balanced_accuracy_score(range_ids, y_pred))
+            m["precision"].append(precision_score(range_ids, y_pred, zero_division=0))
+            m["recall"].append(recall_score(range_ids, y_pred, zero_division=0))
+            m["f1"].append(f1_score(range_ids, y_pred, zero_division=0))
+            m["brier"].append(brier_score_loss(range_ids, y_proba[:, 1]))
+            m["ece"].append(expected_calibration_error(range_ids, y_proba[:, 1]))
 
-            # --- Regression ---
-            pred_low = reg_low.predict(X_noisy)
-            pred_high = reg_high.predict(X_noisy)
-            final_pred = y_proba[:, 0] * pred_low + y_proba[:, 1] * pred_high
+            # Point-estimate regression
+            final_pred = p_lo * reg_lo.predict(X_noisy) + p_hi * reg_hi.predict(X_noisy)
+            m["rmse"].append(np.sqrt(mean_squared_error(y_np, final_pred)))
+            m["r2"].append(r2_score(y_np, final_pred))
 
-            rmse_arr.append(np.sqrt(mean_squared_error(y_test, final_pred)))
-            r2_arr.append(r2_score(y_test, final_pred))
+            # Quantile calibration — low group
+            lo_mask = range_ids == 0
+            if lo_mask.sum() > 0:
+                y_lo = y_np[lo_mask]
+                q10 = reg_lo_q10.predict(X_noisy[lo_mask])
+                q90 = reg_lo_q90.predict(X_noisy[lo_mask])
+                m["coverage_low"].append(_coverage(y_lo, q10, q90))
+                m["mqce_low"].append(_mqce(y_lo, q10, q90))
 
-        # Return aggregated results
-        return (rem_rate, add_rate, {
-            "mcc": (np.mean(mcc_arr), np.std(mcc_arr)),
-            "accuracy": (np.mean(acc_arr), np.std(acc_arr)),
-            "balanced_accuracy": (np.mean(bal_acc_arr), np.std(bal_acc_arr)),
-            "precision": (np.mean(prec_arr), np.std(prec_arr)),
-            "recall": (np.mean(rec_arr), np.std(rec_arr)),
-            "f1": (np.mean(f1_arr), np.std(f1_arr)),
-            "rmse": (np.mean(rmse_arr), np.std(rmse_arr)),
-            "r2": (np.mean(r2_arr), np.std(r2_arr))
-        })
+            # Quantile calibration — high group
+            hi_mask = range_ids == 1
+            if hi_mask.sum() > 0:
+                y_hi = y_np[hi_mask]
+                q10 = reg_hi_q10.predict(X_noisy[hi_mask])
+                q90 = reg_hi_q90.predict(X_noisy[hi_mask])
+                m["coverage_high"].append(_coverage(y_hi, q10, q90))
+                m["mqce_high"].append(_mqce(y_hi, q10, q90))
 
-    # --- Run in parallel ---
+            # End-to-end combined interval
+            f_lo = p_lo * reg_lo_q10.predict(X_noisy) + p_hi * reg_hi_q10.predict(X_noisy)
+            f_hi = p_lo * reg_lo_q90.predict(X_noisy) + p_hi * reg_hi_q90.predict(X_noisy)
+            m["coverage_final"].append(_coverage(y_np, f_lo, f_hi))
+            m["mqce_final"].append(_mqce(y_np, f_lo, f_hi))
+            m["interval_width"].append(float(np.mean(f_hi - f_lo)))
+
+        return rem_rate, add_rate, {k: _agg(v) for k, v in m.items()}
+
     results = Parallel(n_jobs=n_jobs)(
-        delayed(evaluate_one_condition)(rem, add)
-        for rem in cog_removal_rates#tqdm(cog_removal_rates, desc="removal rates")
-        for add in cog_adding_rates
+        delayed(_eval_one)(rem, add)
+        for rem in fn_rates
+        for add in fp_rates
     )
+    return {(rem, add): metrics for rem, add, metrics in results}
 
-    # --- Collect results into dict ---
-    cog_remov_add_accuracies = {(rem, add): metrics for rem, add, metrics in results}
-    return cog_remov_add_accuracies
 
-    
+def read_and_evaluate_models_for_x_and_sigma(
+    trained_models_dir: str,
+    x_noisy_samples: int,
+    noise_type: str,
+    metric: str,
+    all_splits_dict: dict,
+    output_dir: str,
+    clean_test_flag: bool = True,
+    add_rate: float = None,
+    rem_rate: float = None,
+    noise_std: float = 0.3,
+    hard_fn_flag: bool = None,
+) -> dict:
+    """
+    Load serialised models trained at each (FP mean, FN mean) noise level and
+    evaluate them on the validation split.
+
+    Returns
+    -------
+    dict
+        ``{(fp_mean, fn_mean): (mean, std)}`` for the chosen `metric`.
+    """
+    rate_pairs = [(fp, fn) for fp in _FP_MEAN_GRID for fn in _FN_MEAN_GRID]
+    noise_increase_accuracy = {}
+
+    for fp_mean, fn_mean in tqdm(rate_pairs, desc="Processing noise rates"):
+        filename = (
+            f"trained_models_fp_{fp_mean}_fn_{fn_mean}"
+            f"_noise_type_{noise_type}_x_{x_noisy_samples}.pkl"
+        )
+        filepath = os.path.join(output_dir, trained_models_dir, filename)
+
+        metric_keys = ["mcc", "accuracy", "balanced_accuracy", "precision", "recall", "f1", "brier"]
+        metrics_accum = defaultdict(list)
+
+        if os.path.exists(filepath):
+            loaded_models = joblib.load(filepath)
+            for split_id, pipe in loaded_models.items():
+                X = all_splits_dict[split_id]["X_val"]
+                y = all_splits_dict[split_id]["y_val"]
+
+                if clean_test_flag:
+                    X_eval = X
+                else:
+                    X_eval = flip_with_fractional_noise(
+                        X.cpu(), add_rate, rem_rate, noise_std, hard_fn_flag=hard_fn_flag
+                    )
+
+                y_pred = pipe.predict(X_eval)
+                y_prob = pipe.predict_proba(X_eval)[:, 1]
+                y_cpu  = y.cpu()
+
+                metrics_accum["mcc"].append(matthews_corrcoef(y_cpu, y_pred))
+                metrics_accum["accuracy"].append(accuracy_score(y_cpu, y_pred))
+                metrics_accum["balanced_accuracy"].append(balanced_accuracy_score(y_cpu, y_pred))
+                metrics_accum["precision"].append(precision_score(y_cpu, y_pred, zero_division=0))
+                metrics_accum["recall"].append(recall_score(y_cpu, y_pred, zero_division=0))
+                metrics_accum["f1"].append(f1_score(y_cpu, y_pred, zero_division=0))
+                metrics_accum["brier"].append(brier_score_loss(y_cpu, y_prob))
+
+            scores = {k: [np.mean(v), np.std(v)] for k, v in metrics_accum.items()}
+        else:
+            scores = {k: [None, None] for k in metric_keys}
+
+        noise_increase_accuracy[(fp_mean, fn_mean)] = scores
+
+    return {k: v[metric] for k, v in noise_increase_accuracy.items()}
+
+
+def read_and_evaluate_models_for_x_and_sigma_regress(
+    trained_models_dir: str,
+    x_noisy_samples: int,
+    noise_type: str,
+    metric: str,
+    all_splits_dict: dict,
+    output_directory: str,
+    clean_test_flag: bool = True,
+    add_rate: float = None,
+    rem_rate: float = None,
+    noise_std: float = 0.3,
+    hard_fn_flag: bool = None,
+) -> dict:
+    """
+    Load serialised mixture-of-experts models and evaluate them on the
+    validation split. Each stored model is a (classifier, reg_low, reg_high)
+    triple.
+
+    Returns
+    -------
+    dict
+        ``{(fp_mean, fn_mean): (mean, std)}`` for the chosen `metric`.
+    """
+    rate_pairs = [(fp, fn) for fp in _FP_MEAN_GRID for fn in _FN_MEAN_GRID]
+    noise_increase_accuracy = {}
+
+    for fp_mean, fn_mean in tqdm(rate_pairs, desc="Processing noise rates"):
+        filename = (
+            f"trained_models_fp_{fp_mean}_fn_{fn_mean}"
+            f"_noise_type_{noise_type}_x_{x_noisy_samples}.pkl"
+        )
+        filepath = os.path.join(output_directory, trained_models_dir, filename)
+
+        metric_keys = ["mcc", "accuracy", "balanced_accuracy", "precision",
+                       "recall", "f1", "brier", "rmse", "r2"]
+        metrics_accum = defaultdict(list)
+
+        if os.path.exists(filepath):
+            loaded_models = joblib.load(filepath)
+            for split_id, model_tuple in loaded_models.items():
+                classifier, reg_low, reg_high = model_tuple
+                X = all_splits_dict[split_id]["X_val"]
+                y = all_splits_dict[split_id]["y_val"]
+
+                range_ids = np.vectorize({"low": 0, "high": 1}.get)(label_ogt_range(y))
+
+                X_eval = X if clean_test_flag else flip_with_fractional_noise(
+                    X.cpu(), add_rate, rem_rate, noise_std, hard_fn_flag=hard_fn_flag
+                )
+
+                clf_pred  = classifier.predict(X_eval)
+                clf_probs = classifier.predict_proba(X_eval)
+                pred_low  = reg_low.predict(X_eval)
+                pred_high = reg_high.predict(X_eval)
+                final_pred = clf_probs[:, 0] * pred_low + clf_probs[:, 1] * pred_high
+
+                y_np = _to_numpy(y)
+                metrics_accum["mcc"].append(matthews_corrcoef(range_ids, clf_pred))
+                metrics_accum["accuracy"].append(accuracy_score(range_ids, clf_pred))
+                metrics_accum["balanced_accuracy"].append(balanced_accuracy_score(range_ids, clf_pred))
+                metrics_accum["precision"].append(precision_score(range_ids, clf_pred, zero_division=0))
+                metrics_accum["recall"].append(recall_score(range_ids, clf_pred, zero_division=0))
+                metrics_accum["f1"].append(f1_score(range_ids, clf_pred, zero_division=0))
+                metrics_accum["brier"].append(brier_score_loss(range_ids, clf_probs[:, 1]))
+                metrics_accum["rmse"].append(np.sqrt(mean_squared_error(y_np, final_pred)))
+                metrics_accum["r2"].append(r2_score(y_np, final_pred))
+
+            scores = {k: [np.mean(v), np.std(v)] for k, v in metrics_accum.items()}
+        else:
+            scores = {k: [None, None] for k in metric_keys}
+
+        noise_increase_accuracy[(fp_mean, fn_mean)] = scores
+
+    return {k: v[metric] for k, v in noise_increase_accuracy.items()}
+
+
+# Surface-integral analysis
+
+def fp_fn_surface_integral(
+    metric: str,
+    min_fp: float, max_fp: float,
+    min_fn: float, max_fn: float,
+    cog_remov_add_accuracies: dict,
+) -> float:
+    """
+    Compute the 2-D trapezoidal integral of a metric surface over a
+    (FN rate, FP rate) grid.
+
+    Parameters
+    ----------
+    metric : str
+        Key into each ``cog_remov_add_accuracies`` entry dict.
+    min_fp, max_fp, min_fn, max_fn : float
+        Integration bounds (inclusive).
+    cog_remov_add_accuracies : dict
+        ``{(fn_rate, fp_rate): {metric: (mean, std), ...}}``.
+
+    Returns
+    -------
+    float
+        2-D integral approximated by repeated trapezoidal rule.
+    """
+    fn_space = sorted({fn for fn, fp in cog_remov_add_accuracies if min_fn <= fn <= max_fn})
+    fp_space = sorted({fp for fn, fp in cog_remov_add_accuracies if min_fp <= fp <= max_fp})
+
+    Z = np.array([
+        [cog_remov_add_accuracies[(fn, fp)][metric][0] for fn in fn_space]
+        for fp in fp_space
+    ])
+    return float(np.trapezoid(np.trapezoid(Z, x=fn_space, axis=1), x=fp_space))
+
+
+def fp_curve_areas_one_model(
+    metric: str,
+    max_fp: float, max_fn: float,
+    cog_remov_add_accuracies: dict,
+) -> list[float]:
+    """
+    For each FP rate ≤ max_fp, compute the area under the metric-vs-FN-rate
+    curve (trapezoidal rule).
+    """
+    fn_space = sorted({fn for fn, fp in cog_remov_add_accuracies if fn <= max_fn})
+    fp_curves: dict[float, list] = defaultdict(list)
+    for (fn, fp) in cog_remov_add_accuracies:
+        if fp <= max_fp and fn <= max_fn:
+            fp_curves[fp].append(cog_remov_add_accuracies[(fn, fp)][metric][0])
+
+    return [float(np.trapezoid(fp_curves[fp], fn_space)) for fp in fp_curves]
+
+
+# Plotting
+
+def plot_one_accur_measure(ax, accuracy_measure: str, cog_remov_add_accuracies: dict,
+                           alpha: float = 1.0, fontsize: int = 13) -> None:
+    """
+    Plot metric mean ± std vs. FN rate, one line per FP rate.
+
+    Parameters
+    ----------
+    ax : matplotlib Axes
+    accuracy_measure : str
+        Metric key to plot.
+    cog_remov_add_accuracies : dict
+        ``{(fn_rate, fp_rate): {metric: (mean, std), ...}}``.
+    """
+    one_measure = {k: v[accuracy_measure] for k, v in cog_remov_add_accuracies.items()}
+
+    fn_rates = sorted({k[0] for k in one_measure})
+    fp_rates = sorted({k[1] for k in one_measure})
+
+    colors = [plt.cm.tab10(i / max(len(fn_rates) - 1, 1)) for i in range(len(fn_rates))]
+
+    for i, fp in enumerate(fp_rates):
+        pts = [(fn, *one_measure[(fn, fp)]) for fn in fn_rates if (fn, fp) in one_measure]
+        if not pts:
+            continue
+        fns, means, stds = zip(*pts)
+        ax.errorbar(fns, means, yerr=stds, label=fr"$r_{{FP}}={fp}$",
+                    marker="o", capsize=3, linestyle="-", color=colors[i], alpha=alpha)
+
+    ax.set_xlabel(r"$r_{FN}$", fontsize=fontsize)
+    ax.tick_params(axis="x", labelsize=fontsize)
+    ax.tick_params(axis="y", labelsize=fontsize)
+
+
+def plot_model_groups(noise_accuracy: dict, ax, vmin: float = 0.0, vmax: float = 1.0,
+                      cmap: str = "coolwarm", value: str = "Mean") -> None:
+    """Heatmap of mean ± std metric values over a (FP, FN) noise grid."""
+    rows = [[fp, fn, mean, std] for (fp, fn), (mean, std) in noise_accuracy.items()]
+    df = pd.DataFrame(rows, columns=["FP", "FN", "Mean", "Std"])
+    pivot = df.pivot(index="FP", columns="FN", values=value).astype(float)
+    sns.heatmap(pivot, annot=True, fmt=".2f", cmap=cmap,
+                vmin=vmin, vmax=vmax, mask=pivot.isna(), ax=ax, cbar=False)
+
+
+def plot_model_groups_surf_int(noise_accuracy: dict, ax, vmin: float = 0.0, vmax: float = 1.0,
+                               cmap: str = "coolwarm", value: str = "Mean",
+                               tot_int_value: float = 0.04) -> None:
+    """
+    Heatmap of metric values normalised by `tot_int_value` (surface-integral
+    comparison variant of :func:`plot_model_groups`).
+    """
+    rows = [[fp, fn, mean] for (fp, fn), mean in noise_accuracy.items()]
+    df = pd.DataFrame(rows, columns=["FP", "FN", "Mean"])
+    pivot = df.pivot(index="FP", columns="FN", values=value).astype(float) / tot_int_value
+    sns.heatmap(pivot, annot=True, fmt=".2f", cmap=cmap,
+                vmin=vmin, vmax=vmax, mask=pivot.isna(), ax=ax, cbar=False)
