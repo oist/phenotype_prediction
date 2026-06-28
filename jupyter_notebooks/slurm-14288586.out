@@ -1,70 +1,0 @@
-Running with noise_type=exp
-NUM_SPLITS_TO_READ = 5
-Calculating for x_noisy_samples = 100; noise_type = exp
-Noise configs...:   0%|          | 0/18 [00:00<?, ?it/s]Noise configs...:   6%|▌         | 1/18 [11:15<3:11:19, 675.24s/it]Noise configs...:  11%|█         | 2/18 [22:25<2:59:17, 672.35s/it]Noise configs...:  17%|█▋        | 3/18 [33:26<2:46:49, 667.33s/it]Noise configs...:  22%|██▏       | 4/18 [44:27<2:35:06, 664.76s/it]Noise configs...:  28%|██▊       | 5/18 [55:32<2:24:00, 664.64s/it]Noise configs...:  33%|███▎      | 6/18 [1:06:51<2:13:54, 669.57s/it]Noise configs...:  39%|███▉      | 7/18 [1:16:53<1:58:43, 647.61s/it]Noise configs...:  44%|████▍     | 8/18 [1:27:53<1:48:36, 651.61s/it]Noise configs...:  50%|█████     | 9/18 [1:39:36<1:40:08, 667.58s/it]Noise configs...:  56%|█████▌    | 10/18 [1:51:03<1:29:48, 673.52s/it]Noise configs...:  61%|██████    | 11/18 [2:03:04<1:20:16, 688.07s/it]Noise configs...:  67%|██████▋   | 12/18 [2:15:11<1:10:00, 700.01s/it]Noise configs...:  72%|███████▏  | 13/18 [2:25:55<56:54, 682.94s/it]  Noise configs...:  78%|███████▊  | 14/18 [2:39:12<47:49, 717.39s/it]Noise configs...:  83%|████████▎ | 15/18 [2:54:02<38:28, 769.43s/it]/var/spool/slurmd/job14288586/slurm_script: line 13: 3043022 Killed                  python3 -m train_xgboost_on_noisy_aerob.py --x_noisy_samples 100 --noise_type "$noise_type"
-Running with noise_type=unif
-NUM_SPLITS_TO_READ = 5
-Calculating for x_noisy_samples = 100; noise_type = unif
-Noise configs...:   0%|          | 0/18 [00:00<?, ?it/s]Noise configs...:   6%|▌         | 1/18 [11:34<3:16:53, 694.89s/it]Noise configs...:  11%|█         | 2/18 [24:13<3:15:22, 732.66s/it]Noise configs...:  17%|█▋        | 3/18 [37:23<3:09:37, 758.53s/it]Noise configs...:  22%|██▏       | 4/18 [50:56<3:02:02, 780.18s/it]Noise configs...:  28%|██▊       | 5/18 [1:04:48<2:53:04, 798.83s/it]Noise configs...:  33%|███▎      | 6/18 [1:17:06<2:35:37, 778.16s/it]Noise configs...:  39%|███▉      | 7/18 [1:30:07<2:22:49, 779.08s/it]Noise configs...:  44%|████▍     | 8/18 [1:44:28<2:14:12, 805.23s/it]Noise configs...:  50%|█████     | 9/18 [1:59:23<2:04:57, 833.11s/it]Noise configs...:  56%|█████▌    | 10/18 [2:13:35<1:51:52, 839.00s/it]Noise configs...:  61%|██████    | 11/18 [2:27:33<1:37:50, 838.58s/it]/var/spool/slurmd/job14288586/slurm_script: line 13: 3274624 Killed                  python3 -m train_xgboost_on_noisy_aerob.py --x_noisy_samples 100 --noise_type "$noise_type"
-Running with noise_type=gamma
-NUM_SPLITS_TO_READ = 5
-Calculating for x_noisy_samples = 100; noise_type = gamma
-Noise configs...:   0%|          | 0/18 [00:00<?, ?it/s]Noise configs...:   6%|▌         | 1/18 [12:11<3:27:11, 731.25s/it]Noise configs...:  11%|█         | 2/18 [25:53<3:29:18, 784.91s/it]Noise configs...:  17%|█▋        | 3/18 [40:18<3:25:23, 821.57s/it]Noise configs...:  22%|██▏       | 4/18 [51:52<2:59:56, 771.16s/it]Noise configs...:  28%|██▊       | 5/18 [1:03:33<2:41:33, 745.69s/it]Noise configs...:  33%|███▎      | 6/18 [1:14:30<2:23:07, 715.64s/it]Noise configs...:  39%|███▉      | 7/18 [1:25:16<2:07:00, 692.73s/it]Noise configs...:  44%|████▍     | 8/18 [1:37:37<1:58:03, 708.30s/it]Noise configs...:  50%|█████     | 9/18 [1:50:43<1:49:52, 732.54s/it]Noise configs...:  56%|█████▌    | 10/18 [2:03:12<1:38:21, 737.65s/it]Noise configs...:  61%|██████    | 11/18 [2:15:06<1:25:12, 730.33s/it]Noise configs...:  67%|██████▋   | 12/18 [2:26:09<1:10:59, 709.94s/it]Noise configs...:  72%|███████▏  | 13/18 [2:37:38<58:37, 703.59s/it]  Noise configs...:  78%|███████▊  | 14/18 [2:50:27<48:12, 723.11s/it]Noise configs...:  83%|████████▎ | 15/18 [3:04:52<38:17, 765.92s/it]Noise configs...:  89%|████████▉ | 16/18 [3:19:22<26:34, 797.48s/it]Noise configs...:  94%|█████████▍| 17/18 [3:36:15<14:22, 862.21s/it]Noise configs...: 100%|██████████| 18/18 [3:52:29<00:00, 895.80s/it]Noise configs...: 100%|██████████| 18/18 [3:52:29<00:00, 774.98s/it]
-/flash/SzollosiU/anzhelika-koldaeva/gene-context/mlm/pytorch_3.11/bin/python3: Error while finding module specification for 'train_xgboost_on_noisy_aerob.py' (ModuleNotFoundError: __path__ attribute not found on 'train_xgboost_on_noisy_aerob' while trying to find 'train_xgboost_on_noisy_aerob.py'). Try using 'train_xgboost_on_noisy_aerob' instead of 'train_xgboost_on_noisy_aerob.py' as the module name.
-noise_rates = (0.15, 0.0)
-filename = sampled_fps_fns_fp_mean_0.15_fn_mean_0.0_noise_type_gamma_x_100_split_4.txt
-✅ Saved 5 models for noise (0.15, 0.0)
-noise_rates = (0.15, 0.2)
-filename = sampled_fps_fns_fp_mean_0.15_fn_mean_0.2_noise_type_gamma_x_100_split_4.txt
-✅ Saved 5 models for noise (0.15, 0.2)
-noise_rates = (0.15, 0.5)
-filename = sampled_fps_fns_fp_mean_0.15_fn_mean_0.5_noise_type_gamma_x_100_split_4.txt
-✅ Saved 5 models for noise (0.15, 0.5)
-noise_rates = (0.15, 1.0)
-filename = sampled_fps_fns_fp_mean_0.15_fn_mean_1.0_noise_type_gamma_x_100_split_4.txt
-✅ Saved 5 models for noise (0.15, 1.0)
-noise_rates = (0.15, 2.0)
-filename = sampled_fps_fns_fp_mean_0.15_fn_mean_2.0_noise_type_gamma_x_100_split_4.txt
-✅ Saved 5 models for noise (0.15, 2.0)
-noise_rates = (0.15, 4.0)
-filename = sampled_fps_fns_fp_mean_0.15_fn_mean_4.0_noise_type_gamma_x_100_split_4.txt
-✅ Saved 5 models for noise (0.15, 4.0)
-noise_rates = (0.2, 0.0)
-filename = sampled_fps_fns_fp_mean_0.2_fn_mean_0.0_noise_type_gamma_x_100_split_4.txt
-✅ Saved 5 models for noise (0.2, 0.0)
-noise_rates = (0.2, 0.2)
-filename = sampled_fps_fns_fp_mean_0.2_fn_mean_0.2_noise_type_gamma_x_100_split_4.txt
-✅ Saved 5 models for noise (0.2, 0.2)
-noise_rates = (0.2, 0.5)
-filename = sampled_fps_fns_fp_mean_0.2_fn_mean_0.5_noise_type_gamma_x_100_split_4.txt
-✅ Saved 5 models for noise (0.2, 0.5)
-noise_rates = (0.2, 1.0)
-filename = sampled_fps_fns_fp_mean_0.2_fn_mean_1.0_noise_type_gamma_x_100_split_4.txt
-✅ Saved 5 models for noise (0.2, 1.0)
-noise_rates = (0.2, 2.0)
-filename = sampled_fps_fns_fp_mean_0.2_fn_mean_2.0_noise_type_gamma_x_100_split_4.txt
-✅ Saved 5 models for noise (0.2, 2.0)
-noise_rates = (0.2, 4.0)
-filename = sampled_fps_fns_fp_mean_0.2_fn_mean_4.0_noise_type_gamma_x_100_split_4.txt
-✅ Saved 5 models for noise (0.2, 4.0)
-noise_rates = (0.5, 0.0)
-filename = sampled_fps_fns_fp_mean_0.5_fn_mean_0.0_noise_type_gamma_x_100_split_4.txt
-✅ Saved 5 models for noise (0.5, 0.0)
-noise_rates = (0.5, 0.2)
-filename = sampled_fps_fns_fp_mean_0.5_fn_mean_0.2_noise_type_gamma_x_100_split_4.txt
-✅ Saved 5 models for noise (0.5, 0.2)
-noise_rates = (0.5, 0.5)
-filename = sampled_fps_fns_fp_mean_0.5_fn_mean_0.5_noise_type_gamma_x_100_split_4.txt
-✅ Saved 5 models for noise (0.5, 0.5)
-noise_rates = (0.5, 1.0)
-filename = sampled_fps_fns_fp_mean_0.5_fn_mean_1.0_noise_type_gamma_x_100_split_4.txt
-✅ Saved 5 models for noise (0.5, 1.0)
-noise_rates = (0.5, 2.0)
-filename = sampled_fps_fns_fp_mean_0.5_fn_mean_2.0_noise_type_gamma_x_100_split_4.txt
-✅ Saved 5 models for noise (0.5, 2.0)
-noise_rates = (0.5, 4.0)
-filename = sampled_fps_fns_fp_mean_0.5_fn_mean_4.0_noise_type_gamma_x_100_split_4.txt
-✅ Saved 5 models for noise (0.5, 4.0)
-/var/spool/slurmd/job14288586/slurm_script: line 19: syntax error near unexpected token `done'
-/var/spool/slurmd/job14288586/slurm_script: line 19: `done'
-slurmstepd-deigo011216: error: Detected 2 oom_kill events in StepId=14288586.batch. Some of the step tasks have been OOM Killed.

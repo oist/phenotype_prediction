@@ -1,8 +1,0 @@
-Traceback (most recent call last):
-  File "/usr/lib64/python3.6/runpy.py", line 183, in _run_module_as_main
-    mod_name, mod_spec, code = _get_module_details(mod_name, _Error)
-  File "/usr/lib64/python3.6/runpy.py", line 109, in _get_module_details
-    __import__(pkg_name)
-  File "/flash/SzollosiU/anzhelika-koldaeva/gene-context/phenotype_prediction/jupyter_notebooks/aerob_shap_curves.py", line 3, in <module>
-    import torch
-ModuleNotFoundError: No module named 'torch'

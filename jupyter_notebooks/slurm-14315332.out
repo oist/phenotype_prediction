@@ -1,18 +1,0 @@
-Running with noise_type=exp
-NUM_SPLITS_TO_READ = 5
-Calculating for x_noisy_samples = 100; noise_type = exp
-[WARNING] X file '../data_sporulation/input_data_train_val_test/phylum/val_data_phylum_split_3' is empty. Skipping.
-Noise configs...:   0%|          | 0/30 [00:00<?, ?it/s]Noise configs...:   3%|▎         | 1/30 [10:47<5:12:56, 647.46s/it]Noise configs...:   7%|▋         | 2/30 [23:30<5:33:55, 715.54s/it]Noise configs...:  10%|█         | 3/30 [36:30<5:35:07, 744.74s/it]Noise configs...:  13%|█▎        | 4/30 [49:33<5:29:21, 760.05s/it]Noise configs...:  17%|█▋        | 5/30 [1:01:48<5:12:50, 750.84s/it]Noise configs...:  20%|██        | 6/30 [1:14:01<4:57:56, 744.85s/it]/var/spool/slurmd/job14315332/slurm_script: line 13: 3128581 Killed                  python3 -m train_xgboost_on_noisy_sporulat.py --x_noisy_samples 100 --noise_type "$noise_type"
-Running with noise_type=unif
-NUM_SPLITS_TO_READ = 5
-Calculating for x_noisy_samples = 100; noise_type = unif
-[WARNING] X file '../data_sporulation/input_data_train_val_test/phylum/val_data_phylum_split_3' is empty. Skipping.
-Noise configs...:   0%|          | 0/30 [00:00<?, ?it/s]Noise configs...:   3%|▎         | 1/30 [11:25<5:31:20, 685.52s/it]Noise configs...:   7%|▋         | 2/30 [24:36<5:48:52, 747.59s/it]Noise configs...:  10%|█         | 3/30 [37:56<5:47:09, 771.48s/it]Noise configs...:  13%|█▎        | 4/30 [50:39<5:32:50, 768.10s/it]Noise configs...:  17%|█▋        | 5/30 [1:02:34<5:12:04, 748.98s/it]Noise configs...:  20%|██        | 6/30 [1:14:22<4:54:02, 735.09s/it]/var/spool/slurmd/job14315332/slurm_script: line 13: 3558568 Killed                  python3 -m train_xgboost_on_noisy_sporulat.py --x_noisy_samples 100 --noise_type "$noise_type"
-Running with noise_type=gamma
-NUM_SPLITS_TO_READ = 5
-Calculating for x_noisy_samples = 100; noise_type = gamma
-[WARNING] X file '../data_sporulation/input_data_train_val_test/phylum/val_data_phylum_split_3' is empty. Skipping.
-Noise configs...:   0%|          | 0/30 [00:00<?, ?it/s]Noise configs...:   3%|▎         | 1/30 [11:16<5:26:51, 676.27s/it]Noise configs...:   7%|▋         | 2/30 [24:47<5:52:34, 755.50s/it]Noise configs...:  10%|█         | 3/30 [38:14<5:50:36, 779.11s/it]Noise configs...:  13%|█▎        | 4/30 [51:08<5:36:45, 777.12s/it]Noise configs...:  17%|█▋        | 5/30 [1:02:41<5:11:08, 746.76s/it]Noise configs...:  20%|██        | 6/30 [1:13:27<4:44:56, 712.35s/it]Noise configs...:  23%|██▎       | 7/30 [1:25:40<4:35:39, 719.11s/it]Noise configs...:  27%|██▋       | 8/30 [1:39:24<4:35:58, 752.66s/it]/var/spool/slurmd/job14315332/slurm_script: line 13: 3967392 Killed                  python3 -m train_xgboost_on_noisy_sporulat.py --x_noisy_samples 100 --noise_type "$noise_type"
-/var/spool/slurmd/job14315332/slurm_script: line 19: syntax error near unexpected token `done'
-/var/spool/slurmd/job14315332/slurm_script: line 19: `done'
-slurmstepd-deigo010901: error: Detected 3 oom_kill events in StepId=14315332.batch. Some of the step tasks have been OOM Killed.
