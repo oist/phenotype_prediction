@@ -40,7 +40,7 @@ The input `.tree` files are in the `tree/` subdirectory.
 
 ## Data
 
-All the jupyter notebooks and the ba
+The datasets are uploaded to [link] The data directory contains 
 
 Specify all the inputs/outputs!
 
