@@ -19,6 +19,17 @@ The following utility modules are shared across notebooks:
 ### `train_xgboost_on_noisy_data_scripts/`
 Batch training scripts for running model training on noise-augmented data across different noise regimes — varying the number of noisy genome copies per training sample and the false-positive/false-negative rate distributions applied to COG count profiles.
 
+### `tree_stats_visualization/`
+A script for visualising tree statistics across node ages. It plots the prediction confidence for binary classifiers, and the distributions of the predicted values (OGT, GC content) for the regressors.
+
+How to run:
+
+```bash
+$ python3 plot_tree_stats_over_time.py
+```
+
+The input `.tree` files are in the `tree/` subdirectory.
+
 ## Data
 
 All the jupyter notebooks and the ba
