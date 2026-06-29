@@ -5,6 +5,14 @@ Predicting bacterial phenotypes from gene content using noise-robust machine lea
 
 ## Repository structure
 
+### `data_preparation/`
+Contains `taxa_level_split.py` for creating taxonomy-aware train/test splits from the phenotype annotated datasets and the GTDB metadata files
+
+ - `data_preparation/gtdb_files/bac120_metadata_r202.tsv`
+ - `data_preparation/gtdb_files/ar122_metadata_r202.tsv`
+
+The instructions of how to run this function for each phenotype are provided in the function description.
+
 ### `jupyter_notebooks/`
 Contains the full prediction pipeline for each phenotype. Each phenotype has two notebooks:
 
