@@ -40,9 +40,18 @@ The input `.tree` files are in the `tree/` subdirectory.
 
 ## Data
 
-The datasets are uploaded to [link] The data directory contains 
+The datasets are uploaded to [[Zenodo]](https://zenodo.org/records/21018005) The data directory contains 
 
-Specify all the inputs/outputs!
+Datasets for training models on annotated genomes for five phenotypes: oxygen use, cell envelope, sporulation, optimal growth temperature, and GC content.
+
+- data_[phenotype].tar.gz contains the following sub-directories
+
+input_data/ contains sub-directories for each taxonomy level and the taxonomy-aware train/test splits, in 80/20 proportion (30 splits for each tax level),
+input_data_train_val_test/ contains sub-directories for each taxonomy level and the taxonomy-aware train/validation/test splits, in 60/20/20 proportion (30 splits for each tax level),
+outputs/ contains outputs for each taxonomy level.
+data_preparation.tar.gz contains the GTDB metafiles with genome taxonomies that are used to create taxonomy-aware train/test splits.
+
+- phylo_trees.tar.gz contains the GTDB tree files used in the phylogeny-based phenotype prediction algorithm. 
 
 ## Installation
 git clone + pip install, any non-obvious setup steps...
